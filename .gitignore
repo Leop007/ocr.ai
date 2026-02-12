@@ -1,0 +1,24 @@
+# Local config (keep .env.example)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+.eggs/
+
+# Generated summaries (optional: remove to track them)
+invoices_summary/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.Zone.Identifier
+*sec.endpointdlp
+
+# Optional: uncomment to avoid committing PDFs
+# invoices/
+# *.pdf

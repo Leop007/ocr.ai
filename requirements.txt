@@ -1,0 +1,7 @@
+PyPDF2>=3.0
+pillow
+pytesseract
+requests
+python-dotenv
+# Optional: for scanned PDFs (also install poppler: e.g. sudo apt install poppler-utils)
+pdf2image
