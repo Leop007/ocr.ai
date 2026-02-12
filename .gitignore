@@ -20,5 +20,6 @@ Thumbs.db
 *sec.endpointdlp
 
 # Optional: uncomment to avoid committing PDFs
-# invoices/
-# *.pdf
+invoices/
+invoices_summary/
+*.pdf
