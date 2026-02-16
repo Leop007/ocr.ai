@@ -10,8 +10,10 @@ venv/
 *.egg-info/
 .eggs/
 
-# Generated summaries (optional: remove to track them)
+# Generated output
 invoices_summary/
+ocr_output/
+summary_bkp/
 
 # OS / editor
 .DS_Store
