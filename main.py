@@ -5,6 +5,7 @@ import json
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import PyPDF2
@@ -62,6 +63,7 @@ def pdf_to_structured_text(
     ocr_dpi: int = 200,
     force_ocr: bool = False,
     ocr_config: str | None = None,
+    ocr_workers: int | None = None,
 ) -> list[dict]:
     """
     Extract text from each page. Structure: list of {"page": 1-based index, "text": "...", "source": "text"|"ocr"}.
@@ -71,6 +73,7 @@ def pdf_to_structured_text(
     - ocr_dpi: DPI when rendering pages to images for OCR (higher = better quality, slower).
     - force_ocr: if True, always use OCR on every page (for scanned-only PDFs). Ignores digital text.
     - ocr_config: optional Tesseract config (e.g. "--psm 6" for block text).
+    - ocr_workers: max workers for parallel page OCR (default: min(4, pages)). 1 = sequential.
     """
     pdf_path = Path(pdf_path)
     if not pdf_path.exists():
@@ -80,7 +83,6 @@ def pdf_to_structured_text(
         min_text_per_page = 999999
     tesseract_config = ocr_config or DEFAULT_OCR_CONFIG
 
-    result = []
     reader = PyPDF2.PdfReader(str(pdf_path))
     n_pages = len(reader.pages)
 
@@ -92,24 +94,37 @@ def pdf_to_structured_text(
         except Exception:
             page_images = None
 
+    # First pass: get digital text, identify pages needing OCR
+    prelim = []
+    ocr_jobs = []
     for page_num in range(n_pages):
         page = reader.pages[page_num]
         text = extract_text_from_page(page)
-        source = "text"
+        needs_ocr = use_ocr_fallback and len(text.strip()) < min_text_per_page
+        if needs_ocr and page_images is not None and page_num < len(page_images):
+            ocr_jobs.append((page_num + 1, page_images[page_num], text))
+        else:
+            prelim.append((page_num + 1, normalize_text(text), "ocr" if needs_ocr else "text"))
 
-        if use_ocr_fallback and len(text.strip()) < min_text_per_page:
-            if page_images is not None and page_num < len(page_images):
-                text = extract_text_via_ocr(page_images[page_num], config=tesseract_config)
-                source = "ocr"
-
-        text = normalize_text(text)
-        result.append({
-            "page": page_num + 1,
-            "text": text,
-            "source": source,
-        })
-
-    return result
+    # Run OCR on needed pages (parallel if multiple)
+    if not ocr_jobs:
+        return [{"page": p, "text": t, "source": s} for p, t, s in sorted(prelim, key=lambda x: x[0])]
+    if len(ocr_jobs) == 1 or (ocr_workers or 1) <= 1:
+        result = [(p, normalize_text(extract_text_via_ocr(img, config=tesseract_config)), "ocr") for p, img, _ in ocr_jobs]
+    else:
+        workers = ocr_workers or min(4, len(ocr_jobs))
+        result = []
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            fut = {ex.submit(extract_text_via_ocr, img, tesseract_config): (p,) for p, img, _ in ocr_jobs}
+            for f in as_completed(fut):
+                p = fut[f][0]
+                text = normalize_text(f.result())
+                result.append((p, text, "ocr"))
+    # Merge and sort by page number
+    merged = {p: (p, t, s) for p, t, s in prelim}
+    for p, text, src in result:
+        merged[p] = (p, text, src)
+    return [{"page": p, "text": t, "source": s} for p, t, s in sorted(merged.values(), key=lambda x: x[0])]
 
 
 def structured_to_plain_text(structured: list[dict], page_sep: str = "\n\n--- Page {page} ---\n\n") -> str:
@@ -177,6 +192,8 @@ OLLAMA_MODEL = _env("OLLAMA_MODEL", "llama")
 LLM_TIMEOUT = _env_int("LLM_TIMEOUT", 120)
 LLM_MAX_TOKENS = _env_int("LLM_MAX_TOKENS", 2048)
 LLM_TEMPERATURE = _env_float("LLM_TEMPERATURE", 0.2)
+
+GEMINI_MAX_TOKENS = _env_int("GEMINI_MAX_TOKENS", 4096)
 GEMINI_TEMPERATURE = _env_float("GEMINI_TEMPERATURE", LLM_TEMPERATURE)
 
 _prompt_file = _env("PROMPT_FILE", "prompt.txt")
@@ -219,6 +236,73 @@ def load_prompt_file(path: str | Path | None = None) -> str:
     return INVOICE_REVIEW_SYSTEM
 
 
+def _fill_from_truncated_inner(answer_str: str, data: dict) -> str | None:
+    """When inner JSON fails to parse (truncated/malformed), extract fields via regex. Returns extracted answer or None."""
+    if not answer_str or not isinstance(answer_str, str):
+        return None
+    extracted_answer = None
+    # Extract has_issues: true/false
+    m = re.search(r'"has_issues"\s*:\s*(true|false)', answer_str, re.I)
+    if m:
+        data["has_issues"] = m.group(1).lower() == "true"
+    # Extract inner answer text ("answer": "..." - handles escaped quotes)
+    m = re.search(r'"answer"\s*:\s*"((?:[^"\\]|\\.)*)"', answer_str)
+    if m:
+        inner_answer = m.group(1).replace('\\"', '"').replace("\\n", " ").replace("\\r", " ").replace("\\t", " ")
+        extracted_answer = _clean_answer(inner_answer)
+    # Extract issues array (simplified: look for "issues":[ ... ])
+    m = re.search(r'"issues"\s*:\s*\[(.*?)\]', answer_str, re.DOTALL)
+    if m:
+        try:
+            arr = json.loads("[" + m.group(1) + "]")
+            if isinstance(arr, list):
+                data["issues"] = [_clean_answer(str(i)) for i in arr]
+        except json.JSONDecodeError:
+            pass
+    # If has_issues still None, default to False when we have at least partial parse
+    if data.get("has_issues") is None and ("has_issues" in answer_str or '"answer"' in answer_str):
+        data["has_issues"] = bool(data.get("issues"))
+    return extracted_answer
+
+def _normalize_flags(flags) -> str:
+    """Convert flags to a single string (green/orange/red). Handles emoji and duplicate arrays."""
+    if flags is None:
+        return "green"
+    if isinstance(flags, list):
+        # Take worst: red > orange > green. Dedupe and pick one.
+        s = set(str(f).strip().lower() for f in flags if f)
+        if "red" in s:
+            return "red"
+        if "orange" in s:
+            return "orange"
+        if "green" in s:
+            return "green"
+        return flags[0] if flags else "green"
+    s = str(flags).strip().lower()
+    # Map emoji to words (🟢🟠🔴 and similar)
+    if "🟢" in str(flags) or "🟩" in str(flags) or s == "green":
+        return "green"
+    if "🟠" in str(flags) or "🟧" in str(flags) or s == "orange":
+        return "orange"
+    if "🔴" in str(flags) or "🟥" in str(flags) or s == "red":
+        return "red"
+    return s if s in ("green", "orange", "red") else "green"
+
+
+def _clean_answer(text: str) -> str:
+    """Remove escape sequences and normalize whitespace for a clean answer string."""
+    if not text or not isinstance(text, str):
+        return str(text) if text else ""
+    # Replace literal escape sequences (backslash-n, backslash-t, etc.) with spaces
+    s = text.replace("\\n", " ").replace("\\r", " ").replace("\\t", " ")
+    s = s.replace('\\"', '"')
+    # Replace actual newlines and tabs with space
+    s = s.replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    # Collapse multiple spaces and strip
+    s = re.sub(r" +", " ", s).strip()
+    return s
+
+
 def _parse_review_json(content: str) -> tuple[str, dict]:
     """Extract original answer and parsed JSON from model content. Returns (answer_text, json_dict)."""
     raw = content.strip()
@@ -238,15 +322,23 @@ def _parse_review_json(content: str) -> tuple[str, dict]:
                     data["issues"] = inner["issues"]
                 if "has_issues" in inner:
                     data["has_issues"] = inner["has_issues"]
+                if "flags" in inner:
+                    data["flags"] = inner["flags"]
             except json.JSONDecodeError:
-                pass
+                # Inner JSON truncated/malformed - try regex to extract has_issues and answer text
+                extracted = _fill_from_truncated_inner(answer, data)
+                if extracted is not None:
+                    answer = extracted
         if not isinstance(data.get("issues"), list):
             data["issues"] = data.get("issues") or []
-        if "has_issues" not in data:
+        if data.get("has_issues") is None:
             data["has_issues"] = bool(data.get("issues"))
-        return answer, data
+        data["answer"] = _clean_answer(answer)
+        data["issues"] = [_clean_answer(str(i)) for i in data["issues"]]
+        data["flags"] = _normalize_flags(data.get("flags"))
+        return data["answer"], data
     except json.JSONDecodeError:
-        return raw, {"answer": raw, "has_issues": None, "issues": []}
+        return _clean_answer(raw), {"answer": _clean_answer(raw), "has_issues": None, "issues": [], "flags": "green"}
 
 
 def ask_gemini_invoice_review(
@@ -270,7 +362,7 @@ def ask_gemini_invoice_review(
     prompt = (system_prompt or "").strip() or INVOICE_REVIEW_SYSTEM
     model = model or GEMINI_MODEL
     timeout = timeout if timeout is not None else LLM_TIMEOUT
-    max_tokens = max_tokens if max_tokens is not None else LLM_MAX_TOKENS
+    max_tokens = max_tokens if max_tokens is not None else GEMINI_MAX_TOKENS
 
     api_version = "v1beta" if GEMINI_BETA else "v1"
     url = f"https://generativelanguage.googleapis.com/{api_version}/models/{model}:generateContent"
@@ -280,12 +372,16 @@ def ask_gemini_invoice_review(
         f"Review the following document. Reply with ONLY a single JSON object, no other text before or after.\n\n"
         f"{invoice_text}"
     )
+    generation_config = {
+        "maxOutputTokens": max_tokens,
+        "temperature": GEMINI_TEMPERATURE,
+    }
+    # Enable Deep Think reasoning for Gemini 3 models
+    if "gemini-3" in (model or "").lower():
+        generation_config["thinkingConfig"] = {"thinkingLevel": "HIGH"}
     payload = {
         "contents": [{"parts": [{"text": user_message}]}],
-        "generationConfig": {
-            "maxOutputTokens": max_tokens,
-            "temperature": GEMINI_TEMPERATURE,
-        },
+        "generationConfig": generation_config,
     }
     if GEMINI_BETA:
         payload["systemInstruction"] = {"parts": [{"text": prompt}]}
@@ -529,6 +625,24 @@ def run_example(pdf_path: str | Path | None = None, ask_review: bool = True, pro
     return structured, plain, None
 
 
+def _extract_pdf_only(
+    path: Path,
+    use_ocr_fallback: bool = True,
+    force_ocr: bool = False,
+) -> tuple[str, list[dict]]:
+    """Extract text from PDF (no LLM). Returns (plain_text, structured)."""
+    force = force_ocr or _is_in_ocr_dir(path)
+    ocr_dpi = DEFAULT_OCR_DPI_FORCED if force else DEFAULT_OCR_DPI
+    structured = pdf_to_structured_text(
+        path,
+        use_ocr_fallback=use_ocr_fallback,
+        min_text_per_page=DEFAULT_MIN_TEXT_PER_PAGE,
+        ocr_dpi=ocr_dpi,
+        force_ocr=force,
+    )
+    return structured_to_plain_text(structured), structured
+
+
 def run_files(
     file_names: list[str | Path],
     ask_review: bool = True,
@@ -538,58 +652,81 @@ def run_files(
     retry: int = DEFAULT_RETRY,
     retry_interval: int = DEFAULT_RETRY_INTERVAL,
     force_ocr: bool = False,
+    overlap_extract_llm: bool = True,
 ):
     """
     Run extract + optional review on one or more PDF files.
     file_names: list of paths (relative to base_dir or cwd, or absolute).
     prompt_file: path to prompt text file (relative to script dir or absolute). Uses prompt.txt in script dir if None.
+    overlap_extract_llm: when True and processing multiple files, extract next PDF while LLM reviews current.
     """
     base = base_dir or Path(__file__).resolve().parent
     system_prompt = load_prompt_file(prompt_file) if ask_review else None
+    use_ocr = HAS_PDF2IMAGE and HAS_OCR
     if ask_review and prompt_file:
         print(f"Prompt file: {prompt_file}\n")
     results = []
-    for i, name in enumerate(file_names):
-        path = Path(name)
-        if not path.is_absolute():
-            path = base / path
-        sep = "\n" + "=" * 60 + "\n"
-        if i > 0:
-            print(sep)
-        print(f"File [{i + 1}/{len(file_names)}]: {path.name}")
-        if not path.exists():
-            print(f"  Skipped: file not found: {path}")
-            results.append({"file": str(path), "error": "file not found"})
-            continue
-        try:
-            plain, review = extract_and_review_invoice(
-                path, use_ocr_fallback=HAS_PDF2IMAGE and HAS_OCR, system_prompt=system_prompt, llm=llm, retry=retry, retry_interval=retry_interval, force_ocr=force_ocr
-            )
-            n_chars = len(plain)
-            if OCR_OUTPUT_DIR:
-                txt_path = save_extracted_text(path, plain)
-                if txt_path:
-                    print(f"  Extracted text saved to {txt_path}")
-            print(f"  Extracted {n_chars} characters")
-            if not ask_review:
-                print("  --- Extracted text (first 500 chars) ---")
-                print((plain[:500] + ("..." if n_chars > 500 else "")))
-                results.append({"file": path.name, "plain_preview": plain[:500], "review": None})
+    next_extract_future = None
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        for i, name in enumerate(file_names):
+            path = Path(name)
+            if not path.is_absolute():
+                path = base / path
+            sep = "\n" + "=" * 60 + "\n"
+            if i > 0:
+                print(sep)
+            print(f"File [{i + 1}/{len(file_names)}]: {path.name}")
+            if not path.exists():
+                print(f"  Skipped: file not found: {path}")
+                results.append({"file": str(path), "error": "file not found"})
                 continue
-            if review.get("error"):
-                print("  --- Error ---", review["error"])
-                results.append({"file": path.name, "error": review["error"], "json": None})
-                continue
-            print("  --- Review (answer) ---")
-            print("  ", review["answer"].replace("\n", "\n  "))
-            print("  --- Review (JSON) ---")
-            print("  ", json.dumps(review["json"], indent=2, ensure_ascii=False).replace("\n", "\n  "))
-            summary_path = save_run_summary(path, review)
-            print(f"  Summary saved to: {summary_path}")
-            results.append({"file": path.name, "answer": review["answer"], "json": review["json"]})
-        except Exception as e:
-            print(f"  Skipped: {e}")
-            results.append({"file": path.name, "error": str(e)})
+            try:
+                # Get extraction (from previous overlap or do now)
+                if next_extract_future is not None:
+                    plain, structured = next_extract_future.result()
+                else:
+                    plain, structured = _extract_pdf_only(path, use_ocr_fallback=use_ocr, force_ocr=force_ocr)
+                next_extract_future = None
+                # Kick off extraction for next file while we run LLM (if multiple files, ask_review)
+                if overlap_extract_llm and ask_review and i + 1 < len(file_names):
+                    next_path = Path(file_names[i + 1])
+                    if not next_path.is_absolute():
+                        next_path = base / next_path
+                    if next_path.exists():
+                        next_extract_future = ex.submit(
+                            _extract_pdf_only, next_path, use_ocr, force_ocr
+                        )
+                if OCR_OUTPUT_DIR:
+                    txt_path = save_extracted_text(path, plain, structured=structured)
+                    if txt_path:
+                        print(f"  Extracted text saved to {txt_path}")
+                n_chars = len(plain)
+                print(f"  Extracted {n_chars} characters")
+                if not plain.strip():
+                    plain, review = plain, {"answer": "No text could be extracted from the PDF.", "json": {"answer": "No text.", "has_issues": None, "issues": []}, "llm_provider": "", "llm_model": "", "processing_time_seconds": None}
+                elif not ask_review:
+                    print("  --- Extracted text (first 500 chars) ---")
+                    print((plain[:500] + ("..." if n_chars > 500 else "")))
+                    results.append({"file": path.name, "plain_preview": plain[:500], "review": None})
+                    continue
+                else:
+                    t0 = time.perf_counter()
+                    review = ask_invoice_review(plain, system_prompt=system_prompt, llm=llm, retry=retry, retry_interval=retry_interval)
+                    review["processing_time_seconds"] = round(time.perf_counter() - t0, 2)
+                if review.get("error"):
+                    print("  --- Error ---", review["error"])
+                    results.append({"file": path.name, "error": review["error"], "json": None})
+                    continue
+                print("  --- Review (answer) ---")
+                print("  ", review["answer"].replace("\n", "\n  "))
+                print("  --- Review (JSON) ---")
+                print("  ", json.dumps(review["json"], indent=2, ensure_ascii=False).replace("\n", "\n  "))
+                summary_path = save_run_summary(path, review)
+                print(f"  Summary saved to: {summary_path}")
+                results.append({"file": path.name, "answer": review["answer"], "json": review["json"]})
+            except Exception as e:
+                print(f"  Skipped: {e}")
+                results.append({"file": path.name, "error": str(e)})
     return results
 
 
@@ -605,43 +742,63 @@ def _parse_positive_int(val: str, default: int, name: str) -> int:
 
 if __name__ == "__main__":
     import sys
-    argv = sys.argv[1:]
-    ask_review = "--no-llama" not in argv
-    prompt_path = None
-    llm_provider = "auto"
-    retry = DEFAULT_RETRY
-    retry_interval = DEFAULT_RETRY_INTERVAL
-    force_ocr = False
-    args = []
-    i = 0
-    while i < len(argv):
-        if argv[i] == "--prompt" and i + 1 < len(argv):
-            prompt_path = argv[i + 1]
-            i += 2
-            continue
-        if argv[i].startswith("--llm="):
-            llm_provider = argv[i].split("=", 1)[1].strip().lower()
-            if llm_provider not in LLM_PROVIDERS:
-                print(f"Unknown --llm= value: {llm_provider}. Use: {', '.join(LLM_PROVIDERS)}")
-                sys.exit(1)
+
+    def _main() -> None:
+        argv = sys.argv[1:]
+        ask_review = "--no-llama" not in argv
+        prompt_path = None
+        llm_provider = "auto"
+        retry = DEFAULT_RETRY
+        retry_interval = DEFAULT_RETRY_INTERVAL
+        force_ocr = False
+        args = []
+        i = 0
+        while i < len(argv):
+            if argv[i] == "--prompt" and i + 1 < len(argv):
+                prompt_path = argv[i + 1]
+                i += 2
+                continue
+            if argv[i].startswith("--llm="):
+                llm_provider = argv[i].split("=", 1)[1].strip().lower()
+                if llm_provider not in LLM_PROVIDERS:
+                    print(f"Unknown --llm= value: {llm_provider}. Use: {', '.join(LLM_PROVIDERS)}")
+                    sys.exit(1)
+                i += 1
+                continue
+            if argv[i].startswith("--retry="):
+                retry = _parse_positive_int(argv[i].split("=", 1)[1].strip(), DEFAULT_RETRY, "retry")
+                i += 1
+                continue
+            if argv[i].startswith("--retry_interval="):
+                retry_interval = _parse_positive_int(argv[i].split("=", 1)[1].strip(), DEFAULT_RETRY_INTERVAL, "retry_interval")
+                i += 1
+                continue
+            if argv[i] == "--force-ocr":
+                force_ocr = True
+                i += 1
+                continue
+            if argv[i] != "--no-llama":
+                args.append(argv[i])
             i += 1
-            continue
-        if argv[i].startswith("--retry="):
-            retry = _parse_positive_int(argv[i].split("=", 1)[1].strip(), DEFAULT_RETRY, "retry")
-            i += 1
-            continue
-        if argv[i].startswith("--retry_interval="):
-            retry_interval = _parse_positive_int(argv[i].split("=", 1)[1].strip(), DEFAULT_RETRY_INTERVAL, "retry_interval")
-            i += 1
-            continue
-        if argv[i] == "--force-ocr":
-            force_ocr = True
-            i += 1
-            continue
-        if argv[i] != "--no-llama":
-            args.append(argv[i])
-        i += 1
-    if not args:
-        run_example(ask_review=ask_review, prompt_file=prompt_path, llm=llm_provider, retry=retry, retry_interval=retry_interval, force_ocr=force_ocr)
-    else:
-        run_files(args, ask_review=ask_review, prompt_file=prompt_path, llm=llm_provider, retry=retry, retry_interval=retry_interval, force_ocr=force_ocr)
+        if not args:
+            run_example(ask_review=ask_review, prompt_file=prompt_path, llm=llm_provider, retry=retry, retry_interval=retry_interval, force_ocr=force_ocr)
+        else:
+            # Expand directories to their PDF files so multiple files are processed
+            base = Path(__file__).resolve().parent
+            expanded = []
+            for a in args:
+                p = Path(a) if Path(a).is_absolute() else base / a
+                if p.is_dir():
+                    expanded.extend(sorted(p.glob("*.pdf")))
+                else:
+                    expanded.append(p)
+            if expanded:
+                run_files(expanded, ask_review=ask_review, prompt_file=prompt_path, llm=llm_provider, retry=retry, retry_interval=retry_interval, force_ocr=force_ocr)
+            else:
+                print("No PDF files found.")
+
+    try:
+        _main()
+    except KeyboardInterrupt:
+        print("\nInterrupted. Exiting cleanly.")
+        sys.exit(0)

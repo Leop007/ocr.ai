@@ -78,8 +78,9 @@ Copy `.env.example` to `.env` in the `ocr` directory and adjust as needed. The s
 | `LLAMA_SERVER_URL` | Base URL of the local LLM server (Ollama, llama.cpp, etc.) | `http://localhost:8080` |
 | `OLLAMA_MODEL` | Model name (must exist on your server) | `llama` |
 | `LLM_TIMEOUT` | Request timeout (seconds) | `120` |
-| `LLM_MAX_TOKENS` | Max tokens in the model response | `1024` |
-| `LLM_TEMPERATURE` | Sampling temperature | `0.2` |
+| `LLM_MAX_TOKENS` | Max tokens for local model (Ollama/llama.cpp) response | `2048` |
+| `GEMINI_MAX_TOKENS` | Max tokens for Gemini response | `4096` |
+| `LLM_TEMPERATURE` | Sampling temperature (local) | `0.2` |
 | `INVOICES_SUMMARY_DIR` | Where to save run summaries (relative or absolute) | `invoices_summary` |
 | `PROMPT_FILE` | Path to system prompt file (relative or absolute) | `prompt.txt` |
 | `OCR_OUTPUT_DIR` | Directory to save extracted text for inspection (set empty to disable) | `ocr_output` |
