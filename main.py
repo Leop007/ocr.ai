@@ -4,8 +4,10 @@ Extract text from PDF, structure it, and optionally send to llama.cpp for invoic
 import json
 import os
 import re
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 
 import PyPDF2
@@ -28,6 +30,50 @@ except ImportError:
     HAS_OCR = False
 
 
+def _check_tesseract_installed() -> tuple[bool, str]:
+    """
+    Check if Tesseract is installed and configured OCR_LANG is available.
+    Returns (ok, error_msg). Only runs when HAS_OCR is True.
+    """
+    if not HAS_OCR:
+        return False, (
+            "pytesseract is not installed. Run:\n"
+            "  pip install pytesseract\n"
+            "Tesseract and language packs are also required for OCR."
+        )
+    try:
+        pytesseract.get_tesseract_version()
+    except Exception as e:
+        err = str(e).lower()
+        if "tesseract" in err and ("not found" in err or "not in" in err or "path" in err):
+            return False, (
+                "Tesseract is not installed or not in PATH.\n"
+                "On macOS:  brew install tesseract tesseract-lang\n"
+                "On Ubuntu: sudo apt install tesseract-ocr tesseract-ocr-fra tesseract-ocr-deu  (add languages as needed)"
+            )
+        return False, f"Tesseract check failed: {e}"
+
+    try:
+        langs = set(pytesseract.get_languages())
+    except Exception as e:
+        return False, f"Could not list Tesseract languages: {e}"
+
+    lang_setting = (DEFAULT_OCR_LANG or "eng").strip()
+    required = [s.strip() for s in lang_setting.replace("+", " ").split() if s.strip()]
+    if not required:
+        required = ["eng"]
+
+    missing = [l for l in required if l not in langs]
+    if missing:
+        return False, (
+            f"Tesseract language(s) not installed: {', '.join(missing)}\n"
+            f"On macOS: brew install tesseract-lang\n"
+            f"On Ubuntu: sudo apt install tesseract-ocr-<lang>  (e.g. tesseract-ocr-fra)\n"
+            f"Check installed languages: tesseract --list-langs"
+        )
+    return True, ""
+
+
 def normalize_text(text: str) -> str:
     """Collapse whitespace, trim, keep paragraph breaks."""
     if not text or not text.strip():
@@ -46,12 +92,13 @@ def extract_text_from_page(page) -> str:
         return ""
 
 
-def extract_text_via_ocr(image, config: str | None = None) -> str:
-    """Get text from a page image using Tesseract. config: optional Tesseract args (e.g. '--psm 6')."""
+def extract_text_via_ocr(image, config: str | None = None, lang: str | None = None) -> str:
+    """Get text from a page image using Tesseract. config: optional Tesseract args (e.g. '--psm 6'). lang: language code (e.g. 'eng', 'fra')."""
     if not HAS_OCR:
         return ""
     try:
-        return pytesseract.image_to_string(image, config=config or "") or ""
+        lang = (lang or DEFAULT_OCR_LANG).strip() or "eng"
+        return pytesseract.image_to_string(image, config=config or "", lang=lang) or ""
     except Exception:
         return ""
 
@@ -63,6 +110,7 @@ def pdf_to_structured_text(
     ocr_dpi: int = 200,
     force_ocr: bool = False,
     ocr_config: str | None = None,
+    ocr_lang: str | None = None,
     ocr_workers: int | None = None,
 ) -> list[dict]:
     """
@@ -73,6 +121,7 @@ def pdf_to_structured_text(
     - ocr_dpi: DPI when rendering pages to images for OCR (higher = better quality, slower).
     - force_ocr: if True, always use OCR on every page (for scanned-only PDFs). Ignores digital text.
     - ocr_config: optional Tesseract config (e.g. "--psm 6" for block text).
+    - ocr_lang: Tesseract language code (e.g. "eng", "fra", "deu"). Use "+" for multiple: "eng+fra".
     - ocr_workers: max workers for parallel page OCR (default: min(4, pages)). 1 = sequential.
     """
     pdf_path = Path(pdf_path)
@@ -82,6 +131,7 @@ def pdf_to_structured_text(
     if force_ocr:
         min_text_per_page = 999999
     tesseract_config = ocr_config or DEFAULT_OCR_CONFIG
+    tesseract_lang = ocr_lang or DEFAULT_OCR_LANG
 
     reader = PyPDF2.PdfReader(str(pdf_path))
     n_pages = len(reader.pages)
@@ -109,13 +159,16 @@ def pdf_to_structured_text(
     # Run OCR on needed pages (parallel if multiple)
     if not ocr_jobs:
         return [{"page": p, "text": t, "source": s} for p, t, s in sorted(prelim, key=lambda x: x[0])]
+    def _run_ocr(img, cfg, lang):
+        return extract_text_via_ocr(img, config=cfg, lang=lang)
+
     if len(ocr_jobs) == 1 or (ocr_workers or 1) <= 1:
-        result = [(p, normalize_text(extract_text_via_ocr(img, config=tesseract_config)), "ocr") for p, img, _ in ocr_jobs]
+        result = [(p, normalize_text(_run_ocr(img, tesseract_config, tesseract_lang)), "ocr") for p, img, _ in ocr_jobs]
     else:
         workers = ocr_workers or min(4, len(ocr_jobs))
         result = []
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            fut = {ex.submit(extract_text_via_ocr, img, tesseract_config): (p,) for p, img, _ in ocr_jobs}
+            fut = {ex.submit(_run_ocr, img, tesseract_config, tesseract_lang): (p,) for p, img, _ in ocr_jobs}
             for f in as_completed(fut):
                 p = fut[f][0]
                 text = normalize_text(f.result())
@@ -188,6 +241,7 @@ GEMINI_BETA = _env_bool("GEMINI_BETA", False)
 GEMINI_MODEL = _env("GEMINI_MODEL", "gemini-2.5-flash")
 
 DEFAULT_LLAMA_URL = _env("LLAMA_SERVER_URL", "http://localhost:8080")
+OLLAMA_URL = _env("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = _env("OLLAMA_MODEL", "llama")
 LLM_TIMEOUT = _env_int("LLM_TIMEOUT", 120)
 LLM_MAX_TOKENS = _env_int("LLM_MAX_TOKENS", 2048)
@@ -206,6 +260,7 @@ DEFAULT_OCR_DPI = _env_int("OCR_DPI", 200)
 DEFAULT_OCR_DPI_FORCED = _env_int("OCR_DPI_FORCED", 300)
 DEFAULT_MIN_TEXT_PER_PAGE = _env_int("MIN_TEXT_PER_PAGE", 50)
 DEFAULT_OCR_CONFIG = _env("OCR_CONFIG", "--psm 6")
+DEFAULT_OCR_LANG = _env("OCR_LANG", "eng")
 
 _invoices_ocr_dir = _env("INVOICES_OCR_DIR", "")
 INVOICES_OCR_DIR = None
@@ -218,6 +273,9 @@ OCR_OUTPUT_DIR = None
 if _ocr_output_dir.strip():
     p = Path(_ocr_output_dir.strip())
     OCR_OUTPUT_DIR = p if p.is_absolute() else _OCR_DIR / p
+
+_run_log = _env("INVOICES_RUN_LOG", "invoices_run_log.xlsx")
+RUN_LOG_PATH = Path(_run_log) if Path(_run_log).is_absolute() else _OCR_DIR / _run_log
 
 # Fallback if no prompt file is found
 INVOICE_REVIEW_SYSTEM = """You are an expert at reviewing documents. Reply with a single JSON object with keys: "answer" (string), "has_issues" (boolean), "issues" (array of strings)."""
@@ -441,7 +499,98 @@ def ask_llama_invoice_review(
         return {"answer": "", "json": {}, "error": f"Unexpected response: {e}", "llm_provider": "local", "llm_model": OLLAMA_MODEL}
 
 
-LLM_PROVIDERS = ("auto", "local", "gemini")
+def ask_ollama_invoice_review(
+    invoice_text: str,
+    base_url: str | None = None,
+    model: str | None = None,
+    timeout: int | None = None,
+    max_tokens: int | None = None,
+    system_prompt: str | None = None,
+) -> dict:
+    """
+    Send document text to Ollama (native /api/chat) and return the model's review.
+
+    base_url: Ollama server URL (default OLLAMA_URL = http://localhost:11434).
+    model: model name (default OLLAMA_MODEL).
+    Returns dict with "answer", "json", and optionally "error".
+    """
+    prompt = (system_prompt or "").strip() or INVOICE_REVIEW_SYSTEM
+    base_url = (base_url or OLLAMA_URL).rstrip("/")
+    model = (model or OLLAMA_MODEL).strip() or "llama"
+    timeout = timeout if timeout is not None else LLM_TIMEOUT
+    max_tokens = max_tokens if max_tokens is not None else LLM_MAX_TOKENS
+
+    url = f"{base_url}/api/chat"
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": f"Review the following document and reply with the JSON object only.\n\n{invoice_text}"},
+        ],
+        "stream": False,
+        "options": {
+            "temperature": LLM_TEMPERATURE,
+            "num_predict": max_tokens,
+        },
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+        msg = data.get("message", {})
+        content = (msg.get("content") or "").strip()
+        answer, review_json = _parse_review_json(content)
+        return {"answer": answer, "json": review_json, "llm_provider": "ollama", "llm_model": model}
+    except requests.exceptions.RequestException as e:
+        return {"answer": "", "json": {}, "error": str(e), "llm_provider": "ollama", "llm_model": model}
+    except (KeyError, IndexError) as e:
+        return {"answer": "", "json": {}, "error": f"Unexpected response: {e}", "llm_provider": "ollama", "llm_model": model}
+
+
+LLM_PROVIDERS = ("auto", "local", "ollama", "gemini")
+
+
+def _resolve_llm_provider(llm: str) -> str:
+    """Resolve 'auto' to the actual provider."""
+    if llm != "auto":
+        return llm
+    return "gemini" if GEMINI_API_KEY.strip() else "local"
+
+
+def _check_llm_server(llm: str, base_url: str | None = None, timeout: int = 10) -> tuple[bool, str]:
+    """
+    Check if the LLM server is reachable. Returns (ok, error_message).
+    """
+    provider = _resolve_llm_provider(llm)
+    if provider == "gemini":
+        if not GEMINI_API_KEY.strip():
+            return False, "GEMINI_API_KEY is not set"
+        api_version = "v1beta" if GEMINI_BETA else "v1"
+        url = f"https://generativelanguage.googleapis.com/{api_version}/models"
+        try:
+            r = requests.get(url, headers={"x-goog-api-key": GEMINI_API_KEY.strip()}, timeout=timeout)
+            r.raise_for_status()
+            return True, ""
+        except requests.exceptions.RequestException as e:
+            return False, f"Gemini API unreachable: {e}"
+    if provider == "ollama":
+        base = (base_url or OLLAMA_URL).rstrip("/")
+        url = f"{base}/api/tags"
+        try:
+            r = requests.get(url, timeout=timeout)
+            r.raise_for_status()
+            return True, ""
+        except requests.exceptions.RequestException as e:
+            return False, f"Ollama server unreachable at {base}: {e}"
+    # local (llama.cpp)
+    base = (base_url or DEFAULT_LLAMA_URL).rstrip("/")
+    url = f"{base}/v1/models"
+    try:
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        return True, ""
+    except requests.exceptions.RequestException as e:
+        return False, f"llama.cpp server unreachable at {base}: {e}"
 
 
 DEFAULT_RETRY = 2
@@ -461,7 +610,7 @@ def ask_invoice_review(
     """
     Send document text to AI for invoice review.
 
-    llm: "auto" (use Gemini if GEMINI_API_KEY set, else local), "local" (Ollama/llama.cpp),
+    llm: "auto" (Gemini if key set, else local), "local" (llama.cpp), "ollama" (Ollama native),
          "gemini" (Google Gemini).
     retry: number of retries on timeout/server error/empty response (default 2).
     retry_interval: seconds to wait between retries (default 2).
@@ -472,11 +621,13 @@ def ask_invoice_review(
     )
     if use_gemini:
         if not GEMINI_API_KEY.strip():
-            return {"answer": "", "json": {}, "error": "GEMINI_API_KEY is not set. Add it to .env or use --llm=local", "llm_provider": "gemini", "llm_model": GEMINI_MODEL}
+            return {"answer": "", "json": {}, "error": "GEMINI_API_KEY is not set. Add it to .env or use --llm=local/--llm=ollama", "llm_provider": "gemini", "llm_model": GEMINI_MODEL}
 
     def _call() -> dict:
         if use_gemini:
             return ask_gemini_invoice_review(invoice_text, timeout=timeout, max_tokens=max_tokens, system_prompt=system_prompt)
+        if llm == "ollama":
+            return ask_ollama_invoice_review(invoice_text, base_url=base_url, timeout=timeout, max_tokens=max_tokens, system_prompt=system_prompt)
         return ask_llama_invoice_review(invoice_text, base_url=base_url, timeout=timeout, max_tokens=max_tokens, system_prompt=system_prompt)
 
     last_review = None
@@ -491,13 +642,95 @@ def ask_invoice_review(
     return last_review or {"answer": "", "json": {}, "error": "All retries exhausted", "llm_provider": "local", "llm_model": ""}
 
 
-def save_run_summary(pdf_path: str | Path, review: dict, out_dir: Path | None = None) -> Path:
+def _fallback_to_gemini(plain_text: str, system_prompt: str | None = None) -> dict:
+    """If local LLM failed and GEMINI_API_KEY is set, retry with Gemini."""
+    if not GEMINI_API_KEY.strip():
+        return {}
+    return ask_gemini_invoice_review(plain_text, system_prompt=system_prompt)
+
+
+# Excel cell limit
+_EXCEL_CELL_MAX = 32000
+
+
+def append_run_log_row(
+    pdf_path: str | Path,
+    start_timestamp: datetime,
+    ocr_time_seconds: float | None,
+    summary_time_seconds: float | None,
+    ocr_output: str,
+    invoice_summary: str,
+    processed_by: str = "",
+    log_path: Path | None = None,
+) -> None:
+    """Append one row to the run log xlsx. Creates file with headers if needed."""
+    log_path = Path(log_path) if log_path else RUN_LOG_PATH
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        return
+    headers = ("Source file", "Start timestamp", "OCR time (s)", "Summary time (s)", "Who processed", "OCR output", "Invoice summary")
+    create = not log_path.exists()
+    if create:
+        from openpyxl import Workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Runs"
+        for col, h in enumerate(headers, 1):
+            ws.cell(row=1, column=col, value=h)
+        next_row = 2
+    else:
+        wb = load_workbook(log_path)
+        ws = wb.active
+        next_row = ws.max_row + 1
+    ocr_trunc = ocr_output if len(ocr_output) <= _EXCEL_CELL_MAX else ocr_output[:_EXCEL_CELL_MAX - 3] + "..."
+    summary_trunc = invoice_summary if len(invoice_summary) <= _EXCEL_CELL_MAX else invoice_summary[:_EXCEL_CELL_MAX - 3] + "..."
+    def _fmt(t: float | None) -> str:
+        return str(round(t, 2)) if t is not None else ""
+
+    row_data = (
+        Path(pdf_path).name,
+        start_timestamp.isoformat(),
+        _fmt(ocr_time_seconds),
+        _fmt(summary_time_seconds),
+        processed_by or "",
+        ocr_trunc,
+        summary_trunc,
+    )
+    for col, val in enumerate(row_data, 1):
+        ws.cell(row=next_row, column=col, value=val)
+    wb.save(log_path)
+
+
+def _provider_display(provider: str) -> str:
+    """Map llm_provider to display name for run log."""
+    return {"local": "LLM Studio", "ollama": "Ollama", "gemini": "Gemini"}.get(provider or "", provider or "")
+
+
+def _load_from_ocr_cache(pdf_path: str | Path, ocr_dir: Path | None = None) -> str | None:
+    """Load extracted text from ocr_output if it exists. Returns content or None."""
+    if not ocr_dir:
+        return None
+    ocr_dir = Path(ocr_dir)
+    stem = Path(pdf_path).stem
+    txt_path = ocr_dir / f"{stem}_extracted.txt"
+    if not txt_path.exists():
+        return None
+    try:
+        return txt_path.read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+
+def save_run_summary(pdf_path: str | Path, review: dict, out_dir: Path | None = None, llm_rerun: bool = False) -> Path:
     """Save the review summary for a run into invoices_summary directory. Returns path to written file."""
     out_dir = Path(out_dir) if out_dir else INVOICES_SUMMARY_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     path = Path(pdf_path)
     stem = path.stem
-    out_file = out_dir / f"{stem}_summary.json"
+    suffix = "_llm_rerun" if llm_rerun else ""
+    out_file = out_dir / f"{stem}_summary{suffix}.json"
     data = {
         "source_file": path.name,
         "llm_provider": review.get("llm_provider", ""),
@@ -579,27 +812,42 @@ def extract_and_review_invoice(
 
 def run_example(pdf_path: str | Path | None = None, ask_review: bool = True, prompt_file: str | Path | None = None, llm: str = "auto", retry: int = DEFAULT_RETRY, retry_interval: int = DEFAULT_RETRY_INTERVAL, force_ocr: bool = False):
     """Extract text from one PDF and optionally send to llama for invoice review."""
+    if ask_review:
+        ok, err = _check_llm_server(llm)
+        if not ok:
+            print(f"Error: {err}", file=sys.stderr)
+            sys.exit(1)
+
     base = Path(__file__).resolve().parent
     path = Path(pdf_path) if pdf_path else base / "Invoice_Summary_17308199.pdf"
     if not path.is_absolute():
         path = base / path
 
     print(f"Processing: {path.name}\n")
-    force = force_ocr or _is_in_ocr_dir(path)
-    ocr_dpi = DEFAULT_OCR_DPI_FORCED if force else DEFAULT_OCR_DPI
-    structured = pdf_to_structured_text(
-        path,
-        use_ocr_fallback=HAS_PDF2IMAGE and HAS_OCR,
-        min_text_per_page=DEFAULT_MIN_TEXT_PER_PAGE,
-        ocr_dpi=ocr_dpi,
-        force_ocr=force,
-    )
-    print(f"Pages: {len(structured)}\n")
+    start_ts = datetime.now()
 
-    plain = structured_to_plain_text(structured)
-    if OCR_OUTPUT_DIR:
-        save_extracted_text(path, plain, structured=structured)
-        print(f"Extracted text saved to {OCR_OUTPUT_DIR}/\n")
+    plain = _load_from_ocr_cache(path, OCR_OUTPUT_DIR)
+    from_ocr_cache = plain is not None
+    ocr_time_sec: float | None = 0.0 if from_ocr_cache else None
+    if from_ocr_cache:
+        print(f"Using cached extraction from {OCR_OUTPUT_DIR}/\n")
+    else:
+        t_ocr = time.perf_counter()
+        force = force_ocr or _is_in_ocr_dir(path)
+        ocr_dpi = DEFAULT_OCR_DPI_FORCED if force else DEFAULT_OCR_DPI
+        structured = pdf_to_structured_text(
+            path,
+            use_ocr_fallback=HAS_PDF2IMAGE and HAS_OCR,
+            min_text_per_page=DEFAULT_MIN_TEXT_PER_PAGE,
+            ocr_dpi=ocr_dpi,
+            force_ocr=force,
+        )
+        print(f"Pages: {len(structured)}\n")
+        plain = structured_to_plain_text(structured)
+        if OCR_OUTPUT_DIR:
+            save_extracted_text(path, plain, structured=structured)
+            print(f"Extracted text saved to {OCR_OUTPUT_DIR}/\n")
+        ocr_time_sec = round(time.perf_counter() - t_ocr, 2)
     print("--- Extracted text (first 1500 chars) ---\n")
     print(plain[:1500] + ("..." if len(plain) > 1500 else ""))
     print("\n---\n")
@@ -612,6 +860,16 @@ def run_example(pdf_path: str | Path | None = None, ask_review: bool = True, pro
         t0 = time.perf_counter()
         review = ask_invoice_review(plain, system_prompt=system_prompt, llm=llm, retry=retry, retry_interval=retry_interval)
         review["processing_time_seconds"] = round(time.perf_counter() - t0, 2)
+        if review.get("error") and llm != "gemini" and GEMINI_API_KEY.strip():
+            print("  Retrying with Gemini...\n")
+            t1 = time.perf_counter()
+            fallback = _fallback_to_gemini(plain, system_prompt=system_prompt)
+            if fallback and not fallback.get("error"):
+                fallback["processing_time_seconds"] = round(time.perf_counter() - t1, 2)
+                review = fallback
+                print("  Gemini fallback succeeded.\n")
+            else:
+                print("  Gemini fallback failed.\n")
         if review.get("error"):
             print("--- Error ---\n", review["error"])
         else:
@@ -619,10 +877,17 @@ def run_example(pdf_path: str | Path | None = None, ask_review: bool = True, pro
             print(review["answer"])
             print("\n--- Invoice review (JSON) ---\n")
             print(json.dumps(review["json"], indent=2, ensure_ascii=False))
-            summary_path = save_run_summary(path, review)
+            summary_path = save_run_summary(path, review, llm_rerun=from_ocr_cache)
             print(f"\nSummary saved to: {summary_path}")
-        return structured, plain, review
-    return structured, plain, None
+        summary_text = review.get("answer", "") or review.get("error", "")
+        append_run_log_row(path, start_ts, ocr_time_sec, review.get("processing_time_seconds"), plain, summary_text, _provider_display(review.get("llm_provider", "")))
+        return (None, plain, review) if from_ocr_cache else (structured, plain, review)
+    if not plain.strip():
+        append_run_log_row(path, start_ts, ocr_time_sec, None, plain, "No text extracted", "")
+        return (None, plain, None) if from_ocr_cache else (structured, plain, None)
+    if not ask_review:
+        append_run_log_row(path, start_ts, ocr_time_sec, None, plain, "(extraction only, no LLM)", "")
+        return (None, plain, None) if from_ocr_cache else (structured, plain, None)
 
 
 def _extract_pdf_only(
@@ -643,6 +908,17 @@ def _extract_pdf_only(
     return structured_to_plain_text(structured), structured
 
 
+def _extract_pdf_only_timed(
+    path: Path,
+    use_ocr_fallback: bool = True,
+    force_ocr: bool = False,
+) -> tuple[str, list[dict], float]:
+    """Extract text from PDF with timing. Returns (plain_text, structured, ocr_time_seconds)."""
+    t0 = time.perf_counter()
+    plain, structured = _extract_pdf_only(path, use_ocr_fallback=use_ocr_fallback, force_ocr=force_ocr)
+    return plain, structured, round(time.perf_counter() - t0, 2)
+
+
 def run_files(
     file_names: list[str | Path],
     ask_review: bool = True,
@@ -660,6 +936,12 @@ def run_files(
     prompt_file: path to prompt text file (relative to script dir or absolute). Uses prompt.txt in script dir if None.
     overlap_extract_llm: when True and processing multiple files, extract next PDF while LLM reviews current.
     """
+    if ask_review:
+        ok, err = _check_llm_server(llm)
+        if not ok:
+            print(f"Error: {err}", file=sys.stderr)
+            sys.exit(1)
+
     base = base_dir or Path(__file__).resolve().parent
     system_prompt = load_prompt_file(prompt_file) if ask_review else None
     use_ocr = HAS_PDF2IMAGE and HAS_OCR
@@ -676,53 +958,80 @@ def run_files(
             if i > 0:
                 print(sep)
             print(f"File [{i + 1}/{len(file_names)}]: {path.name}")
+            start_ts = datetime.now()
             if not path.exists():
                 print(f"  Skipped: file not found: {path}")
                 results.append({"file": str(path), "error": "file not found"})
                 continue
             try:
-                # Get extraction (from previous overlap or do now)
-                if next_extract_future is not None:
-                    plain, structured = next_extract_future.result()
+                # Check for cached ocr_output first
+                plain = _load_from_ocr_cache(path, OCR_OUTPUT_DIR)
+                from_ocr_cache = plain is not None
+                ocr_time_sec: float | None = 0.0 if from_ocr_cache else None
+                if from_ocr_cache:
+                    print(f"  Using cached extraction from {OCR_OUTPUT_DIR}/")
+                    if next_extract_future is not None:
+                        next_extract_future.result()  # consume to stay in sync
+                    next_extract_future = None
                 else:
-                    plain, structured = _extract_pdf_only(path, use_ocr_fallback=use_ocr, force_ocr=force_ocr)
-                next_extract_future = None
-                # Kick off extraction for next file while we run LLM (if multiple files, ask_review)
-                if overlap_extract_llm and ask_review and i + 1 < len(file_names):
-                    next_path = Path(file_names[i + 1])
-                    if not next_path.is_absolute():
-                        next_path = base / next_path
-                    if next_path.exists():
-                        next_extract_future = ex.submit(
-                            _extract_pdf_only, next_path, use_ocr, force_ocr
-                        )
-                if OCR_OUTPUT_DIR:
-                    txt_path = save_extracted_text(path, plain, structured=structured)
-                    if txt_path:
-                        print(f"  Extracted text saved to {txt_path}")
+                    # Get extraction (from previous overlap or do now)
+                    if next_extract_future is not None:
+                        plain, structured, ocr_time_sec = next_extract_future.result()
+                    else:
+                        plain, structured, ocr_time_sec = _extract_pdf_only_timed(path, use_ocr_fallback=use_ocr, force_ocr=force_ocr)
+                    next_extract_future = None
+                    # Kick off extraction for next file while we run LLM (if multiple files, ask_review)
+                    if overlap_extract_llm and ask_review and i + 1 < len(file_names):
+                        next_path = Path(file_names[i + 1])
+                        if not next_path.is_absolute():
+                            next_path = base / next_path
+                        if next_path.exists() and not _load_from_ocr_cache(next_path, OCR_OUTPUT_DIR):
+                            next_extract_future = ex.submit(
+                                _extract_pdf_only_timed, next_path, use_ocr, force_ocr
+                            )
+                    if OCR_OUTPUT_DIR:
+                        txt_path = save_extracted_text(path, plain, structured=structured if not from_ocr_cache else None)
+                        if txt_path:
+                            print(f"  Extracted text saved to {txt_path}")
                 n_chars = len(plain)
                 print(f"  Extracted {n_chars} characters")
                 if not plain.strip():
-                    plain, review = plain, {"answer": "No text could be extracted from the PDF.", "json": {"answer": "No text.", "has_issues": None, "issues": []}, "llm_provider": "", "llm_model": "", "processing_time_seconds": None}
+                    append_run_log_row(path, start_ts, ocr_time_sec, None, plain, "No text extracted", "")
+                    results.append({"file": path.name, "error": "No text extracted", "json": None})
+                    continue
                 elif not ask_review:
                     print("  --- Extracted text (first 500 chars) ---")
                     print((plain[:500] + ("..." if n_chars > 500 else "")))
+                    append_run_log_row(path, start_ts, ocr_time_sec, None, plain, "(extraction only, no LLM)", "")
                     results.append({"file": path.name, "plain_preview": plain[:500], "review": None})
                     continue
                 else:
                     t0 = time.perf_counter()
                     review = ask_invoice_review(plain, system_prompt=system_prompt, llm=llm, retry=retry, retry_interval=retry_interval)
                     review["processing_time_seconds"] = round(time.perf_counter() - t0, 2)
+                    if review.get("error") and llm != "gemini" and GEMINI_API_KEY.strip():
+                        print("  Retrying with Gemini...")
+                        t1 = time.perf_counter()
+                        fallback = _fallback_to_gemini(plain, system_prompt=system_prompt)
+                        if fallback and not fallback.get("error"):
+                            fallback["processing_time_seconds"] = round(time.perf_counter() - t1, 2)
+                            review = fallback
+                            print("  Gemini fallback succeeded.")
+                        else:
+                            print("  Gemini fallback failed.")
                 if review.get("error"):
                     print("  --- Error ---", review["error"])
+                    append_run_log_row(path, start_ts, ocr_time_sec, review.get("processing_time_seconds"), plain, review.get("error", "Unknown error"), _provider_display(review.get("llm_provider", "")))
                     results.append({"file": path.name, "error": review["error"], "json": None})
                     continue
                 print("  --- Review (answer) ---")
                 print("  ", review["answer"].replace("\n", "\n  "))
                 print("  --- Review (JSON) ---")
                 print("  ", json.dumps(review["json"], indent=2, ensure_ascii=False).replace("\n", "\n  "))
-                summary_path = save_run_summary(path, review)
+                summary_path = save_run_summary(path, review, llm_rerun=from_ocr_cache)
                 print(f"  Summary saved to: {summary_path}")
+                summary_text = review.get("answer", "") or review.get("error", "")
+                append_run_log_row(path, start_ts, ocr_time_sec, review.get("processing_time_seconds"), plain, summary_text, _provider_display(review.get("llm_provider", "")))
                 results.append({"file": path.name, "answer": review["answer"], "json": review["json"]})
             except Exception as e:
                 print(f"  Skipped: {e}")
@@ -780,6 +1089,12 @@ if __name__ == "__main__":
             if argv[i] != "--no-llama":
                 args.append(argv[i])
             i += 1
+
+        ok, err = _check_tesseract_installed()
+        if not ok:
+            print(f"Error: {err}", file=sys.stderr)
+            sys.exit(1)
+
         if not args:
             run_example(ask_review=ask_review, prompt_file=prompt_path, llm=llm_provider, retry=retry, retry_interval=retry_interval, force_ocr=force_ocr)
         else:

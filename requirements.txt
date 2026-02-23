@@ -4,3 +4,4 @@ pytesseract
 requests
 python-dotenv
 pdf2image
+openpyxl>=3.1

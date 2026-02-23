@@ -2,10 +2,12 @@
 Simple CLI for OCR invoice extraction and AI review.
 Run with: python app.py
 """
+import sys
 from pathlib import Path
 
 from main import (
     GEMINI_API_KEY,
+    _check_tesseract_installed,
     run_files,
 )
 
@@ -15,22 +17,29 @@ _BASE = Path(__file__).resolve().parent
 def prompt_model() -> str:
     """Ask user to choose local or remote model."""
     print("\nModel:")
-    print("  1. Local (Ollama/llama.cpp)")
-    print("  2. Remote (Google Gemini)")
+    print("  1. Ollama (local, default localhost:11434)")
+    print("  2. llama.cpp (local, OpenAI-compatible)")
+    print("  3. Remote (Google Gemini)")
     while True:
-        choice = input("Choose [1/2]: ").strip()
+        choice = input("Choose [1/2/3]: ").strip()
         if choice == "1":
-            return "local"
+            return "ollama"
         if choice == "2":
+            return "local"
+        if choice == "3":
             if not GEMINI_API_KEY.strip():
-                print("  GEMINI_API_KEY not set in .env. Use Local or add the key.")
+                print("  GEMINI_API_KEY not set in .env. Use Ollama/llama.cpp or add the key.")
                 continue
             return "gemini"
-        print("  Enter 1 or 2")
+        print("  Enter 1, 2, or 3")
 
 
 def main() -> None:
     print("=== Invoice OCR & AI Review ===\n")
+    ok, err = _check_tesseract_installed()
+    if not ok:
+        print(f"Error: {err}", file=sys.stderr)
+        sys.exit(1)
     llm = prompt_model()
     path_input = input("PDF file or folder path: ").strip()
     if not path_input:
@@ -52,7 +61,8 @@ def main() -> None:
         print(f"Not found or not a PDF: {p}")
         return
 
-    print(f"\nProcessing with {'Gemini' if llm == 'gemini' else 'Ollama'} (extract + LLM in parallel)...\n")
+    llm_names = {"gemini": "Gemini", "ollama": "Ollama", "local": "llama.cpp"}
+    print(f"\nProcessing with {llm_names.get(llm, llm)} (extract + LLM in parallel)...\n")
 
     run_files(
         paths,

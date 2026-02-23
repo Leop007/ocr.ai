@@ -13,7 +13,8 @@ venv/
 # Generated output
 invoices_summary/
 ocr_output/
-summary_bkp/
+*.xlsx
+backup/
 
 # OS / editor
 .DS_Store
