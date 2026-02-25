@@ -33,9 +33,11 @@ Paths are relative to the `ocr` directory (or use absolute paths). Each file is 
 
 | Option | Description |
 |--------|-------------|
-| `--no-llama` | Only extract text; do not call the LLM for review. |
+| `--ocr-only` | OCR only: extract text with Tesseract (and digital extraction); no LLM review. Same as `--no-llama`. |
+| `--no-llama` | Same as `--ocr-only`: extraction only, no LLM. |
 | `--force-ocr` | Always use OCR on every page (for scanned PDFs). Uses 300 DPI. |
-| `--llm=<provider>` | LLM provider: `auto` (default), `local` (llama.cpp), `ollama` (Ollama native), or `gemini` (Google AI). |
+| `--ocr=<method>` | Extraction method: `tesseract` (default) or `llm`. If `llm`, PDF pages are sent to a vision LLM instead of Tesseract (no Tesseract required). |
+| `--llm=<provider>` | When using LLM: `auto` (default), `local` (llama.cpp / LM Studio), `ollama` (Ollama), or `gemini` (Google AI). |
 | `--retry=<n>` | Number of retries on timeout/server error/empty response (default: 2). |
 | `--retry_interval=<n>` | Seconds to wait between retries (default: 2). |
 | `--prompt <path>` | Use a custom system prompt from a text file (default: `prompt.txt` in this directory). |
@@ -43,8 +45,13 @@ Paths are relative to the `ocr` directory (or use absolute paths). Each file is 
 **Examples:**
 
 ```bash
-# Extract text only, no LLM review
-python main.py --no-llama my_invoice.pdf
+# OCR only (extract text, no LLM review)
+python main.py --ocr-only my_invoice.pdf
+# or: python main.py --no-llama my_invoice.pdf
+
+# OCR only with LLM (vision): extract text via LLM instead of Tesseract; no review
+python main.py --ocr-only --ocr=llm my_invoice.pdf
+# Pick LLM: python main.py --ocr-only --ocr=llm --llm=gemini my_invoice.pdf
 
 # Use Google Gemini (requires GEMINI_API_KEY in .env)
 python main.py --llm=gemini invoice.pdf
@@ -62,9 +69,26 @@ python main.py --retry=4 --retry_interval=5 invoice.pdf
 python main.py --prompt my_prompt.txt invoice.pdf
 ```
 
+### Local vs remote LLM
+
+- **OCR** is always done by **Tesseract** (local).
+- **Review** (and optional amount extraction) uses either:
+  - **Local:** `--llm=ollama` (Ollama) or `--llm=local` (llama.cpp / LM Studio).
+  - **Remote:** `--llm=gemini` (Google Gemini; requires `GEMINI_API_KEY`).
+
+Use `python app.py` to pick local (Ollama / llama.cpp) or remote (Gemini) interactively.
+
+### OCR only with LLM (no Tesseract)
+
+You can use a **vision-capable LLM** to extract text from PDF pages instead of Tesseract. Use `--ocr=llm` (and optionally `--ocr-only` for extraction only, no review). The same LLM providers are supported (Gemini, Ollama, LM Studio / llama.cpp with a vision model). Requires `pdf2image` and poppler; Tesseract is not required when using `--ocr=llm`. In `python app.py`, choose option **2. OCR only with LLM**.
+
+### Number comparison (Tesseract vs LLM)
+
+Amounts are extracted from the Tesseract OCR text and, when the LLM returns a `numbers` array (see `prompt.txt`), compared with the LLM’s amounts. The result is in each run summary as `number_comparison`: `ocr_numbers`, `llm_numbers`, `match`, and `mismatches`. Summaries are written to `invoices_summary/<stem>_summary.json`.
+
 ## Output
 
-- **Console:** Extracted text preview and the review answer + JSON for each file.
+- **Console:** Extracted text preview, review answer + JSON, and (when available) number comparison (OCR vs LLM).
 
 ### Re-runs with cached OCR
 
@@ -72,14 +96,15 @@ When `OCR_OUTPUT_DIR` is set and an extracted text file already exists (`ocr_out
 
 ### Run log (XLSX)
 
-Each processed file is appended to `invoices_run_log.xlsx` (or `INVOICES_RUN_LOG`), with columns: Source file, Start timestamp, OCR time (s), Summary time (s), Who processed (Ollama/LLM Studio/Gemini), OCR output, Invoice summary. Every run adds new rows.
+Each script run creates a **new** timestamped log file in the `log_files/` directory (e.g. `log_files/invoices_run_log_2025-02-12_143052.xlsx`). Columns: Source file, Start timestamp, OCR time (s), Summary time (s), Who processed, OCR output, Invoice summary. All files processed in that run are written to that single log file.
 
 ### Gemini fallback
 
 When the local LLM (Ollama, llama.cpp, LM Studio) fails, and `GEMINI_API_KEY` is set, the script automatically retries with Google Gemini using the same OCR text.
+
 - **`invoices_summary/`:** For each reviewed PDF, a JSON file is written:  
   `invoices_summary/<pdf_stem>_summary.json`  
-  Contents: `source_file`, `answer`, and the review fields (`has_issues`, `issues`, etc.).  
+  Contents: `source_file`, `answer`, review fields (`has_issues`, `issues`, `flags`), optional `numbers`, and `number_comparison` (OCR vs LLM amounts).  
   The directory is created automatically.
 
 ## Configuration (.env)
@@ -99,7 +124,7 @@ Copy `.env.example` to `.env` in the `ocr` directory and adjust as needed. The s
 | `LLM_TEMPERATURE` | Sampling temperature (local) | `0.2` |
 | `INVOICES_SUMMARY_DIR` | Where to save run summaries (relative or absolute) | `invoices_summary` |
 | `PROMPT_FILE` | Path to system prompt file (relative or absolute) | `prompt.txt` |
-| `INVOICES_RUN_LOG` | XLSX file to append run logs (per-file: timestamp, processing time, OCR output, summary) | `invoices_run_log.xlsx` |
+| `INVOICES_RUN_LOG` | Base name for run logs; each run creates `log_files/{stem}_{YYYY-MM-DD_HHMMSS}.xlsx` | `invoices_run_log.xlsx` |
 | `OCR_OUTPUT_DIR` | Directory to save extracted text for inspection (set empty to disable) | `ocr_output` |
 | `INVOICES_OCR_DIR` | Directory for scanned-only PDFs; files here always use OCR (300 DPI) | — |
 | `OCR_DPI` | DPI for OCR fallback mode | `200` |

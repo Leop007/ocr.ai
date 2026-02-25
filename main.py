@@ -1,6 +1,8 @@
 """
 Extract text from PDF, structure it, and optionally send to llama.cpp for invoice review.
 """
+import base64
+import io
 import json
 import os
 import re
@@ -28,6 +30,23 @@ try:
     HAS_OCR = True
 except ImportError:
     HAS_OCR = False
+try:
+    from docx import Document as DocxDocument
+    HAS_DOCX = True
+except ImportError:
+    HAS_DOCX = False
+try:
+    import openpyxl
+    HAS_XLSX = True
+except ImportError:
+    HAS_XLSX = False
+try:
+    import xlrd
+    HAS_XLS = True
+except ImportError:
+    HAS_XLS = False
+
+SUPPORTED_OFFICE_EXTENSIONS = (".doc", ".docx", ".xls", ".xlsx")
 
 
 def _check_tesseract_installed() -> tuple[bool, str]:
@@ -204,6 +223,213 @@ def structured_to_paragraphs(structured: list[dict]) -> list[dict]:
     return paragraphs
 
 
+# --- Native extraction for Word and Excel (no PDF conversion) ---
+
+def _extract_docx(path: Path) -> tuple[str, list[dict]]:
+    """Extract text from .docx. Returns (plain_text, structured list of {page, text, source})."""
+    if not HAS_DOCX:
+        return "", [{"page": 1, "text": "", "source": "text"}]
+    doc = DocxDocument(path)
+    parts: list[str] = []
+    for para in doc.paragraphs:
+        if para.text.strip():
+            parts.append(para.text)
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [c.text.strip() for c in row.cells]
+            if any(cells):
+                parts.append("\t".join(cells))
+    text = "\n\n".join(parts).strip()
+    structured = [{"page": 1, "text": text, "source": "text"}] if text else []
+    return text, structured
+
+
+def _extract_doc(path: Path) -> tuple[str, list[dict]]:
+    """Extract text from legacy .doc via LibreOffice headless if available."""
+    import subprocess
+    out_dir = path.parent
+    try:
+        subprocess.run(
+            ["soffice", "--headless", "--convert-to", "txt", "--outdir", str(out_dir), str(path)],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )
+        # LibreOffice outputs e.g. path.stem + ".txt"
+        candidate = out_dir / (path.stem + ".txt")
+        if candidate.exists():
+            text = candidate.read_text(encoding="utf-8", errors="replace").strip()
+            try:
+                candidate.unlink()
+            except OSError:
+                pass
+            structured = [{"page": 1, "text": text, "source": "text"}] if text else []
+            return text, structured
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        pass
+    return "", [{"page": 1, "text": "(.doc requires LibreOffice: install 'libreoffice' and run soffice --headless)", "source": "text"}]
+
+
+def _extract_xlsx(path: Path) -> tuple[str, list[dict]]:
+    """Extract cell text from .xlsx. One 'page' per sheet."""
+    if not HAS_XLSX:
+        return "", []
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    structured: list[dict] = []
+    for idx, sheet in enumerate(wb.worksheets, start=1):
+        rows = []
+        for row in sheet.iter_rows(values_only=True):
+            cells = [str(c) if c is not None else "" for c in row]
+            if any(c.strip() for c in cells):
+                rows.append("\t".join(cells))
+        text = "\n".join(rows).strip()
+        if text:
+            structured.append({"page": idx, "text": f"--- Sheet: {sheet.title} ---\n\n{text}", "source": "text"})
+    wb.close()
+    plain = structured_to_plain_text(structured, page_sep="\n\n") if structured else ""
+    return plain, structured
+
+
+def _extract_xls(path: Path) -> tuple[str, list[dict]]:
+    """Extract cell text from legacy .xls."""
+    if not HAS_XLS:
+        return "", []
+    wb = xlrd.open_workbook(path)
+    structured = []
+    for idx in range(wb.nsheets):
+        sheet = wb.sheet_by_index(idx)
+        rows = []
+        for row_idx in range(sheet.nrows):
+            cells = [str(sheet.cell_value(row_idx, c)) for c in range(sheet.ncols)]
+            if any(c.strip() for c in cells):
+                rows.append("\t".join(cells))
+        text = "\n".join(rows).strip()
+        if text:
+            structured.append({"page": idx + 1, "text": f"--- Sheet: {sheet.name} ---\n\n{text}", "source": "text"})
+    plain = structured_to_plain_text(structured, page_sep="\n\n") if structured else ""
+    return plain, structured
+
+
+def _extract_office_file(path: Path) -> tuple[str, list[dict]]:
+    """Dispatch by extension. Returns (plain_text, structured)."""
+    suf = path.suffix.lower()
+    if suf == ".docx" and HAS_DOCX:
+        return _extract_docx(path)
+    if suf == ".doc":
+        return _extract_doc(path)
+    if suf == ".xlsx" and HAS_XLSX:
+        return _extract_xlsx(path)
+    if suf == ".xls" and HAS_XLS:
+        return _extract_xls(path)
+    return "", []
+
+
+def _is_office_file(path: Path) -> bool:
+    return path.suffix.lower() in SUPPORTED_OFFICE_EXTENSIONS
+
+
+# --- Number extraction from OCR (Tesseract) text and comparison with LLM ---
+
+# Match currency amounts: 1,234.56 / 1.234,56 and optional € $ etc.
+_NUM_PATTERN = re.compile(
+    r"(?:\b|\s)"
+    r"(\d{1,3}(?:[,\s]\d{3})*(?:[.,]\d+)?|\d+(?:[.,]\d+)?)"
+    r"\s*(?:€|EUR|USD|\$|CHF|GBP)?"
+    r"(?:\s|\b)",
+    re.IGNORECASE,
+)
+
+
+def _normalize_number_str(s: str) -> float | None:
+    """Parse a number string (EU 1.234,56 or US 1,234.56) to float. Returns None if invalid."""
+    s = (s or "").strip().replace(" ", "")
+    if not s:
+        return None
+    # EU: comma as decimal separator, dot as thousands
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        # Could be EU (1,5 = 1.5) or thousands (1,234)
+        if re.match(r"^\d+,\d{3}(?:,\d{3})*$", s):
+            s = s.replace(",", "")
+        else:
+            s = s.replace(",", ".")
+    else:
+        s = s.replace(",", "")  # strip thousands comma
+    try:
+        return round(float(s), 2)
+    except ValueError:
+        return None
+
+
+def extract_numbers_from_text(text: str) -> list[dict]:
+    """
+    Extract numeric amounts from OCR/text (e.g. Tesseract output).
+    Returns list of {"value": float, "raw": str, "line": str} for each amount found.
+    """
+    if not text or not text.strip():
+        return []
+    seen_values: set[float] = set()
+    result: list[dict] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        for m in _NUM_PATTERN.finditer(line):
+            raw = m.group(1).strip()
+            val = _normalize_number_str(raw)
+            if val is None or val < 0:
+                continue
+            # Dedupe by value on same line (e.g. "620,00 €" once)
+            if val in seen_values and result and result[-1].get("line") == line:
+                continue
+            seen_values.add(val)
+            result.append({"value": val, "raw": raw, "line": line[:80]})
+    return result
+
+
+def compare_ocr_llm_numbers(ocr_text: str, review_json: dict) -> dict:
+    """
+    Compare numbers extracted from Tesseract OCR text with numbers from the LLM review.
+    review_json may contain optional "numbers": [{"label": str, "value": number}, ...].
+    Returns dict with ocr_numbers, llm_numbers, match (bool), mismatches (list).
+    """
+    ocr_numbers = extract_numbers_from_text(ocr_text or "")
+    llm_raw = review_json.get("numbers")
+    llm_numbers: list[dict] = []
+    if isinstance(llm_raw, list):
+        for item in llm_raw:
+            if not isinstance(item, dict):
+                continue
+            v = item.get("value")
+            if v is None:
+                try:
+                    v = float(item.get("value_str", 0))
+                except (TypeError, ValueError):
+                    continue
+            try:
+                val = round(float(v), 2)
+                llm_numbers.append({"label": str(item.get("label", "")).strip(), "value": val})
+            except (TypeError, ValueError):
+                continue
+
+    ocr_vals = {n["value"] for n in ocr_numbers}
+    llm_vals = {n["value"] for n in llm_numbers}
+    mismatch_list: list[dict] = []
+    for n in llm_numbers:
+        if n["value"] not in ocr_vals:
+            mismatch_list.append({"source": "llm_only", "label": n["label"], "value": n["value"]})
+    for n in ocr_numbers:
+        if n["value"] not in llm_vals and llm_numbers:
+            mismatch_list.append({"source": "ocr_only", "value": n["value"], "raw": n["raw"], "line": n["line"]})
+    return {
+        "ocr_numbers": [{"value": n["value"], "raw": n["raw"], "line": n["line"]} for n in ocr_numbers],
+        "llm_numbers": llm_numbers,
+        "match": len(mismatch_list) == 0 if llm_numbers else None,  # None = no LLM numbers to compare
+        "mismatches": mismatch_list,
+    }
+
+
 # --- Config from environment ---
 
 _OCR_DIR = Path(__file__).resolve().parent
@@ -243,6 +469,11 @@ GEMINI_MODEL = _env("GEMINI_MODEL", "gemini-2.5-flash")
 DEFAULT_LLAMA_URL = _env("LLAMA_SERVER_URL", "http://localhost:8080")
 OLLAMA_URL = _env("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = _env("OLLAMA_MODEL", "llama")
+# LM Studio / local: separate models for vision (OCR) and summary. If unset, use OLLAMA_MODEL for both.
+LLAMA_MODEL = _env("LLAMA_MODEL", "").strip() or OLLAMA_MODEL
+LLAMA_VISION_MODEL = _env("LLAMA_VISION_MODEL", "").strip() or OLLAMA_MODEL
+# Keep model loaded between requests so Ollama can reuse system-prompt cache across files (e.g. "5m", "60m", "-1").
+OLLAMA_KEEP_ALIVE = _env("OLLAMA_KEEP_ALIVE", "5m").strip()
 LLM_TIMEOUT = _env_int("LLM_TIMEOUT", 120)
 LLM_MAX_TOKENS = _env_int("LLM_MAX_TOKENS", 2048)
 LLM_TEMPERATURE = _env_float("LLM_TEMPERATURE", 0.2)
@@ -261,6 +492,10 @@ DEFAULT_OCR_DPI_FORCED = _env_int("OCR_DPI_FORCED", 300)
 DEFAULT_MIN_TEXT_PER_PAGE = _env_int("MIN_TEXT_PER_PAGE", 50)
 DEFAULT_OCR_CONFIG = _env("OCR_CONFIG", "--psm 6")
 DEFAULT_OCR_LANG = _env("OCR_LANG", "eng")
+OCR_METHOD_TESSERACT = "tesseract"
+OCR_METHOD_LLM = "llm"
+_ocr_method_env = _env("OCR_METHOD", OCR_METHOD_TESSERACT).strip().lower()
+DEFAULT_OCR_METHOD = OCR_METHOD_LLM if _ocr_method_env == "llm" else OCR_METHOD_TESSERACT
 
 _invoices_ocr_dir = _env("INVOICES_OCR_DIR", "")
 INVOICES_OCR_DIR = None
@@ -280,15 +515,22 @@ RUN_LOG_PATH = Path(_run_log) if Path(_run_log).is_absolute() else _OCR_DIR / _r
 # Fallback if no prompt file is found
 INVOICE_REVIEW_SYSTEM = """You are an expert at reviewing documents. Reply with a single JSON object with keys: "answer" (string), "has_issues" (boolean), "issues" (array of strings)."""
 
+# In-memory cache for prompt file: (path, mtime) -> content. Same prompt is used for all files in a run.
+_PROMPT_CACHE: dict[tuple[Path, float], str] = {}
+
 
 def load_prompt_file(path: str | Path | None = None) -> str:
-    """Load system prompt from a text file. Returns fallback INVOICE_REVIEW_SYSTEM if file missing."""
+    """Load system prompt from a text file. Cached by (path, mtime) so the same prompt is reused for all files in a run."""
     p = Path(path) if path else DEFAULT_PROMPT_FILE
     if not p.is_absolute():
         p = Path(__file__).resolve().parent / p
     try:
         if p.exists():
-            return p.read_text(encoding="utf-8").strip()
+            mtime = p.stat().st_mtime
+            key = (p.resolve(), mtime)
+            if key not in _PROMPT_CACHE:
+                _PROMPT_CACHE[key] = p.read_text(encoding="utf-8").strip()
+            return _PROMPT_CACHE[key]
     except Exception:
         pass
     return INVOICE_REVIEW_SYSTEM
@@ -394,6 +636,9 @@ def _parse_review_json(content: str) -> tuple[str, dict]:
         data["answer"] = _clean_answer(answer)
         data["issues"] = [_clean_answer(str(i)) for i in data["issues"]]
         data["flags"] = _normalize_flags(data.get("flags"))
+        # Preserve optional "numbers" from LLM for comparison with OCR
+        if not isinstance(data.get("numbers"), list):
+            data["numbers"] = data.get("numbers") or []
         return data["answer"], data
     except json.JSONDecodeError:
         return _clean_answer(raw), {"answer": _clean_answer(raw), "has_issues": None, "issues": [], "flags": "green"}
@@ -475,9 +720,10 @@ def ask_llama_invoice_review(
     base_url = (base_url or DEFAULT_LLAMA_URL).rstrip("/")
     timeout = timeout if timeout is not None else LLM_TIMEOUT
     max_tokens = max_tokens if max_tokens is not None else LLM_MAX_TOKENS
+    model = LLAMA_MODEL
     url = f"{base_url}/v1/chat/completions"
     payload = {
-        "model": OLLAMA_MODEL,
+        "model": model,
         "messages": [
             {"role": "system", "content": prompt},
             {"role": "user", "content": f"Review the following document and reply with the JSON object only.\n\n{invoice_text}"},
@@ -492,11 +738,11 @@ def ask_llama_invoice_review(
         choice = data.get("choices", [{}])[0]
         content = (choice.get("message", {}) or {}).get("content", "").strip()
         answer, review_json = _parse_review_json(content)
-        return {"answer": answer, "json": review_json, "llm_provider": "local", "llm_model": OLLAMA_MODEL}
+        return {"answer": answer, "json": review_json, "llm_provider": "local", "llm_model": model}
     except requests.exceptions.RequestException as e:
-        return {"answer": "", "json": {}, "error": str(e), "llm_provider": "local", "llm_model": OLLAMA_MODEL}
+        return {"answer": "", "json": {}, "error": str(e), "llm_provider": "local", "llm_model": model}
     except (KeyError, IndexError) as e:
-        return {"answer": "", "json": {}, "error": f"Unexpected response: {e}", "llm_provider": "local", "llm_model": OLLAMA_MODEL}
+        return {"answer": "", "json": {}, "error": f"Unexpected response: {e}", "llm_provider": "local", "llm_model": model}
 
 
 def ask_ollama_invoice_review(
@@ -533,6 +779,8 @@ def ask_ollama_invoice_review(
             "num_predict": max_tokens,
         },
     }
+    if OLLAMA_KEEP_ALIVE:
+        payload["keep_alive"] = OLLAMA_KEEP_ALIVE
     try:
         r = requests.post(url, json=payload, timeout=timeout)
         r.raise_for_status()
@@ -547,6 +795,193 @@ def ask_ollama_invoice_review(
         return {"answer": "", "json": {}, "error": f"Unexpected response: {e}", "llm_provider": "ollama", "llm_model": model}
 
 
+# --- LLM vision: extract text from a single page image (OCR via LLM instead of Tesseract) ---
+
+LLM_EXTRACT_TEXT_PROMPT = "Extract all text from this document or invoice page exactly as written. Preserve layout, numbers, and amounts. Return only the raw text, no commentary."
+
+# Retry same page on LLM vision failure (e.g. 500 from LM Studio). First error is kept for investigation.
+# Common causes of 500 from LM Studio/llama.cpp: OOM, image+context too large, server overload, or API mismatch.
+VISION_RETRY_ATTEMPTS = 3
+VISION_RETRY_INTERVAL_SEC = 5
+
+
+def _image_pil_to_base64(image) -> str:
+    """Encode a PIL Image to PNG base64 string."""
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _ask_llm_extract_text_from_image(
+    image_base64: str,
+    llm: str,
+    base_url: str | None = None,
+    timeout: int | None = None,
+    max_tokens: int | None = None,
+) -> tuple[str, str]:
+    """
+    Send one page image to LLM (vision) and return extracted text.
+    Returns (text, error). error is non-empty on failure.
+    """
+    provider = _resolve_llm_provider(llm) if llm != "auto" else ("gemini" if GEMINI_API_KEY.strip() else "local")
+    timeout = timeout or LLM_TIMEOUT
+    max_tokens = max_tokens or LLM_MAX_TOKENS
+
+    if provider == "gemini":
+        key = GEMINI_API_KEY.strip()
+        if not key:
+            return "", "GEMINI_API_KEY is not set"
+        api_version = "v1beta" if GEMINI_BETA else "v1"
+        url = f"https://generativelanguage.googleapis.com/{api_version}/models/{GEMINI_MODEL}:generateContent"
+        headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"inline_data": {"mime_type": "image/png", "data": image_base64}},
+                    {"text": LLM_EXTRACT_TEXT_PROMPT},
+                ],
+            }],
+            "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.1},
+        }
+        try:
+            r = requests.post(url, json=payload, headers=headers, timeout=timeout)
+            r.raise_for_status()
+            data = r.json()
+            parts = (data.get("candidates", [{}])[0].get("content", {}).get("parts", []))
+            text = (parts[0].get("text", "") if parts else "").strip()
+            return text, ""
+        except requests.exceptions.RequestException as e:
+            return "", str(e)
+        except (KeyError, IndexError) as e:
+            return "", f"Unexpected response: {e}"
+
+    if provider == "ollama":
+        base = (base_url or OLLAMA_URL).rstrip("/")
+        url = f"{base}/api/chat"
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": [
+                {"role": "user", "content": LLM_EXTRACT_TEXT_PROMPT, "images": [image_base64]},
+            ],
+            "stream": False,
+            "options": {"temperature": 0.1, "num_predict": max_tokens},
+        }
+        try:
+            r = requests.post(url, json=payload, timeout=timeout)
+            r.raise_for_status()
+            data = r.json()
+            text = (data.get("message", {}).get("content") or "").strip()
+            return text, ""
+        except requests.exceptions.RequestException as e:
+            return "", str(e)
+        except (KeyError, IndexError) as e:
+            return "", f"Unexpected response: {e}"
+
+    # local: try OpenAI-compatible vision first, then LM Studio native vision API (uses LLAMA_VISION_MODEL for OCR)
+    base = (base_url or DEFAULT_LLAMA_URL).rstrip("/")
+    data_url = f"data:image/png;base64,{image_base64}"
+    model = LLAMA_VISION_MODEL
+
+    # 1) OpenAI-compatible: /v1/chat/completions with image_url
+    url_openai = f"{base}/v1/chat/completions"
+    payload_openai = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": LLM_EXTRACT_TEXT_PROMPT},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            },
+        ],
+        "max_tokens": max_tokens,
+        "temperature": 0.1,
+    }
+    try:
+        r = requests.post(url_openai, json=payload_openai, timeout=timeout)
+        if r.status_code == 200:
+            data = r.json()
+            choice = data.get("choices", [{}])[0]
+            text = (choice.get("message", {}) or {}).get("content", "").strip()
+            return text, ""
+        if r.status_code not in (400, 422, 404):
+            r.raise_for_status()
+    except requests.exceptions.RequestException:
+        pass
+
+    # 2) LM Studio native: /api/v1/chat with input[] and type "image" / "data_url"
+    url_lms = f"{base}/api/v1/chat"
+    payload_lms = {
+        "model": model,
+        "input": [
+            {"type": "text", "content": LLM_EXTRACT_TEXT_PROMPT},
+            {"type": "image", "data_url": data_url},
+        ],
+        "temperature": 0.1,
+        "max_output_tokens": max_tokens,
+    }
+    try:
+        r = requests.post(url_lms, json=payload_lms, timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+        for item in data.get("output", []):
+            if item.get("type") == "message" and "content" in item:
+                return (item["content"] or "").strip(), ""
+        return "", "No message in LM Studio response"
+    except requests.exceptions.RequestException as e:
+        return "", str(e)
+    except (KeyError, IndexError) as e:
+        return "", f"Unexpected response: {e}"
+
+
+def pdf_to_text_via_llm_vision(
+    pdf_path: str | Path,
+    llm: str = "auto",
+    base_url: str | None = None,
+    ocr_dpi: int = 200,
+    timeout: int | None = None,
+) -> tuple[str, list[dict]]:
+    """
+    Extract text from PDF by sending each page image to an LLM (vision). No Tesseract.
+    Returns (plain_text, structured) where structured is list of {"page", "text", "source": "llm"}.
+    Requires pdf2image (poppler). Uses same llm provider as review (gemini, ollama, local).
+    """
+    pdf_path = Path(pdf_path)
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+    if not HAS_PDF2IMAGE:
+        raise RuntimeError("pdf2image is required for LLM OCR. pip install pdf2image and install poppler.")
+    try:
+        images = convert_from_path(str(pdf_path), dpi=ocr_dpi)
+    except Exception as e:
+        raise RuntimeError(f"Failed to render PDF to images: {e}") from e
+    structured = []
+    for page_num, img in enumerate(images, 1):
+        b64 = _image_pil_to_base64(img)
+        first_error: str | None = None
+        text = ""
+        for attempt in range(VISION_RETRY_ATTEMPTS):
+            text, err = _ask_llm_extract_text_from_image(b64, llm, base_url=base_url, timeout=timeout)
+            if not err:
+                break
+            if first_error is None:
+                first_error = err
+            if attempt < VISION_RETRY_ATTEMPTS - 1:
+                time.sleep(VISION_RETRY_INTERVAL_SEC)
+        if err:
+            text = f"[LLM vision error on page {page_num}: {first_error}]"
+            if VISION_RETRY_ATTEMPTS > 1:
+                text += f" (retried {VISION_RETRY_ATTEMPTS - 1} times)"
+        text = normalize_text(text)
+        page_entry: dict = {"page": page_num, "text": text, "source": "llm"}
+        if first_error is not None:
+            page_entry["vision_error"] = first_error
+        structured.append(page_entry)
+    plain = structured_to_plain_text(structured)
+    return plain, structured
+
+
 LLM_PROVIDERS = ("auto", "local", "ollama", "gemini")
 
 
@@ -557,6 +992,17 @@ def _resolve_llm_provider(llm: str) -> str:
     return "gemini" if GEMINI_API_KEY.strip() else "local"
 
 
+def _connection_error_message(e: requests.exceptions.RequestException, service: str, base: str) -> str:
+    """Turn a requests exception into a short, human-readable message."""
+    if isinstance(e, requests.exceptions.ConnectTimeout):
+        return f"Could not connect to {service} at {base}. Connection timed out. Is the server running?"
+    if isinstance(e, requests.exceptions.ConnectionError):
+        return f"Could not connect to {service} at {base}. Is the server running?"
+    if isinstance(e, requests.exceptions.Timeout):
+        return f"{service} at {base} did not respond in time."
+    return f"Could not reach {service} at {base}."
+
+
 def _check_llm_server(llm: str, base_url: str | None = None, timeout: int = 10) -> tuple[bool, str]:
     """
     Check if the LLM server is reachable. Returns (ok, error_message).
@@ -564,15 +1010,30 @@ def _check_llm_server(llm: str, base_url: str | None = None, timeout: int = 10) 
     provider = _resolve_llm_provider(llm)
     if provider == "gemini":
         if not GEMINI_API_KEY.strip():
-            return False, "GEMINI_API_KEY is not set"
+            return False, "GEMINI_API_KEY is not set in .env."
+        # Validate key with a minimal generateContent call (GET /models can return 400 with some keys)
         api_version = "v1beta" if GEMINI_BETA else "v1"
-        url = f"https://generativelanguage.googleapis.com/{api_version}/models"
+        model = GEMINI_MODEL
+        url = f"https://generativelanguage.googleapis.com/{api_version}/models/{model}:generateContent"
+        headers = {"x-goog-api-key": GEMINI_API_KEY.strip(), "Content-Type": "application/json"}
+        payload = {
+            "contents": [{"parts": [{"text": "Hi"}]}],
+            "generationConfig": {"maxOutputTokens": 1},
+        }
         try:
-            r = requests.get(url, headers={"x-goog-api-key": GEMINI_API_KEY.strip()}, timeout=timeout)
+            r = requests.post(url, json=payload, headers=headers, timeout=timeout)
+            if r.status_code == 200:
+                return True, ""
+            if r.status_code in (400, 403, 404):
+                try:
+                    err_body = r.json()
+                    msg = err_body.get("error", {}).get("message", r.text) or r.text
+                except Exception:
+                    msg = r.text
+                return False, f"Gemini API error ({r.status_code}): {msg}"
             r.raise_for_status()
-            return True, ""
         except requests.exceptions.RequestException as e:
-            return False, f"Gemini API unreachable: {e}"
+            return False, _connection_error_message(e, "Gemini API", "generativelanguage.googleapis.com")
     if provider == "ollama":
         base = (base_url or OLLAMA_URL).rstrip("/")
         url = f"{base}/api/tags"
@@ -581,8 +1042,8 @@ def _check_llm_server(llm: str, base_url: str | None = None, timeout: int = 10) 
             r.raise_for_status()
             return True, ""
         except requests.exceptions.RequestException as e:
-            return False, f"Ollama server unreachable at {base}: {e}"
-    # local (llama.cpp)
+            return False, _connection_error_message(e, "Ollama", base)
+    # local (llama.cpp / LM Studio)
     base = (base_url or DEFAULT_LLAMA_URL).rstrip("/")
     url = f"{base}/v1/models"
     try:
@@ -590,7 +1051,7 @@ def _check_llm_server(llm: str, base_url: str | None = None, timeout: int = 10) 
         r.raise_for_status()
         return True, ""
     except requests.exceptions.RequestException as e:
-        return False, f"llama.cpp server unreachable at {base}: {e}"
+        return False, _connection_error_message(e, "LM Studio / llama.cpp", base)
 
 
 DEFAULT_RETRY = 2
@@ -651,6 +1112,15 @@ def _fallback_to_gemini(plain_text: str, system_prompt: str | None = None) -> di
 
 # Excel cell limit
 _EXCEL_CELL_MAX = 32000
+
+
+def make_run_log_path() -> Path:
+    """Return a new run log file path with timestamp for this script run. One file per invocation. Saved under log_files/."""
+    stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    base_path = Path(RUN_LOG_PATH)
+    stem = base_path.stem
+    suffix = base_path.suffix
+    return base_path.parent / "log_files" / f"{stem}_{stamp}{suffix}"
 
 
 def append_run_log_row(
@@ -754,6 +1224,9 @@ def save_extracted_text(pdf_path: str | Path, plain_text: str, structured: list[
     header = f"# Extracted from {Path(pdf_path).name}\n"
     if structured:
         header += "# Per-page: " + ", ".join(f"p{p['page']}={p['source']}" for p in structured) + "\n"
+        for p in structured:
+            if p.get("vision_error"):
+                header += f"# Page {p['page']} vision_error (investigation): {p['vision_error']}\n"
     txt_path.write_text(header + "\n" + plain_text, encoding="utf-8")
     return txt_path
 
@@ -780,26 +1253,34 @@ def extract_and_review_invoice(
     retry: int = DEFAULT_RETRY,
     retry_interval: int = DEFAULT_RETRY_INTERVAL,
     force_ocr: bool = False,
+    ocr_method: str | None = None,
 ) -> tuple[str, dict]:
     """
     Extract text from PDF, send to AI, return (plain_invoice_text, review_result).
 
-    llm: "auto", "local", or "gemini".
-    force_ocr: always use OCR on every page (for scanned PDFs).
+    llm: "auto", "local", "ollama", or "gemini".
+    force_ocr: always use OCR on every page (for scanned PDFs; ignored when ocr_method=llm).
+    ocr_method: OCR_METHOD_TESSERACT (default) or OCR_METHOD_LLM. If "llm", use LLM vision instead of Tesseract.
     """
     pdf_path = Path(pdf_path)
     if not pdf_path.is_absolute():
         pdf_path = Path(__file__).resolve().parent / pdf_path
-    force = force_ocr or _is_in_ocr_dir(pdf_path)
-    ocr_dpi = DEFAULT_OCR_DPI_FORCED if force else DEFAULT_OCR_DPI
-    structured = pdf_to_structured_text(
-        pdf_path,
-        use_ocr_fallback=use_ocr_fallback and HAS_PDF2IMAGE and HAS_OCR,
-        min_text_per_page=DEFAULT_MIN_TEXT_PER_PAGE,
-        ocr_dpi=ocr_dpi,
-        force_ocr=force,
-    )
-    plain = structured_to_plain_text(structured)
+    method = (ocr_method or DEFAULT_OCR_METHOD).strip().lower()
+    if method == OCR_METHOD_LLM:
+        force = force_ocr or _is_in_ocr_dir(pdf_path)
+        ocr_dpi = DEFAULT_OCR_DPI_FORCED if force else DEFAULT_OCR_DPI
+        plain, structured = pdf_to_text_via_llm_vision(pdf_path, llm=llm, base_url=llama_url, ocr_dpi=ocr_dpi)
+    else:
+        force = force_ocr or _is_in_ocr_dir(pdf_path)
+        ocr_dpi = DEFAULT_OCR_DPI_FORCED if force else DEFAULT_OCR_DPI
+        structured = pdf_to_structured_text(
+            pdf_path,
+            use_ocr_fallback=use_ocr_fallback and HAS_PDF2IMAGE and HAS_OCR,
+            min_text_per_page=DEFAULT_MIN_TEXT_PER_PAGE,
+            ocr_dpi=ocr_dpi,
+            force_ocr=force,
+        )
+        plain = structured_to_plain_text(structured)
     if OCR_OUTPUT_DIR:
         save_extracted_text(pdf_path, plain, structured=structured)
     if not plain.strip():
@@ -807,15 +1288,19 @@ def extract_and_review_invoice(
     t0 = time.perf_counter()
     review = ask_invoice_review(plain, base_url=llama_url, system_prompt=system_prompt, llm=llm, retry=retry, retry_interval=retry_interval)
     review["processing_time_seconds"] = round(time.perf_counter() - t0, 2)
+    # Compare numbers from Tesseract OCR with LLM-extracted numbers (if any)
+    if review.get("json") is not None:
+        review["json"]["number_comparison"] = compare_ocr_llm_numbers(plain, review["json"])
     return plain, review
 
 
-def run_example(pdf_path: str | Path | None = None, ask_review: bool = True, prompt_file: str | Path | None = None, llm: str = "auto", retry: int = DEFAULT_RETRY, retry_interval: int = DEFAULT_RETRY_INTERVAL, force_ocr: bool = False):
+def run_example(pdf_path: str | Path | None = None, ask_review: bool = True, prompt_file: str | Path | None = None, llm: str = "auto", retry: int = DEFAULT_RETRY, retry_interval: int = DEFAULT_RETRY_INTERVAL, force_ocr: bool = False, ocr_method: str | None = None):
     """Extract text from one PDF and optionally send to llama for invoice review."""
-    if ask_review:
+    method = (ocr_method or DEFAULT_OCR_METHOD).strip().lower()
+    if ask_review or method == OCR_METHOD_LLM:
         ok, err = _check_llm_server(llm)
         if not ok:
-            print(f"Error: {err}", file=sys.stderr)
+            print(err)
             sys.exit(1)
 
     base = Path(__file__).resolve().parent
@@ -825,25 +1310,34 @@ def run_example(pdf_path: str | Path | None = None, ask_review: bool = True, pro
 
     print(f"Processing: {path.name}\n")
     start_ts = datetime.now()
+    run_log_path = make_run_log_path()
+    print(f"Run log: {run_log_path}\n")
 
     plain = _load_from_ocr_cache(path, OCR_OUTPUT_DIR)
     from_ocr_cache = plain is not None
+    structured = None
     ocr_time_sec: float | None = 0.0 if from_ocr_cache else None
     if from_ocr_cache:
         print(f"Using cached extraction from {OCR_OUTPUT_DIR}/\n")
     else:
         t_ocr = time.perf_counter()
-        force = force_ocr or _is_in_ocr_dir(path)
-        ocr_dpi = DEFAULT_OCR_DPI_FORCED if force else DEFAULT_OCR_DPI
-        structured = pdf_to_structured_text(
-            path,
-            use_ocr_fallback=HAS_PDF2IMAGE and HAS_OCR,
-            min_text_per_page=DEFAULT_MIN_TEXT_PER_PAGE,
-            ocr_dpi=ocr_dpi,
-            force_ocr=force,
-        )
-        print(f"Pages: {len(structured)}\n")
-        plain = structured_to_plain_text(structured)
+        if method == OCR_METHOD_LLM:
+            plain, structured = pdf_to_text_via_llm_vision(
+                path, llm=llm, ocr_dpi=DEFAULT_OCR_DPI_FORCED if (force_ocr or _is_in_ocr_dir(path)) else DEFAULT_OCR_DPI
+            )
+            print(f"Pages: {len(structured)}\n")
+        else:
+            force = force_ocr or _is_in_ocr_dir(path)
+            ocr_dpi = DEFAULT_OCR_DPI_FORCED if force else DEFAULT_OCR_DPI
+            structured = pdf_to_structured_text(
+                path,
+                use_ocr_fallback=HAS_PDF2IMAGE and HAS_OCR,
+                min_text_per_page=DEFAULT_MIN_TEXT_PER_PAGE,
+                ocr_dpi=ocr_dpi,
+                force_ocr=force,
+            )
+            print(f"Pages: {len(structured)}\n")
+            plain = structured_to_plain_text(structured)
         if OCR_OUTPUT_DIR:
             save_extracted_text(path, plain, structured=structured)
             print(f"Extracted text saved to {OCR_OUTPUT_DIR}/\n")
@@ -877,16 +1371,22 @@ def run_example(pdf_path: str | Path | None = None, ask_review: bool = True, pro
             print(review["answer"])
             print("\n--- Invoice review (JSON) ---\n")
             print(json.dumps(review["json"], indent=2, ensure_ascii=False))
+            nc = (review.get("json") or {}).get("number_comparison")
+            if nc:
+                print("\n--- Numbers (Tesseract OCR vs LLM) ---")
+                print(f"  OCR amounts: {len(nc.get('ocr_numbers', []))} | LLM amounts: {len(nc.get('llm_numbers', []))} | Match: {nc.get('match')}")
+                if nc.get("mismatches"):
+                    print("  Mismatches:", json.dumps(nc["mismatches"], indent=4, ensure_ascii=False))
             summary_path = save_run_summary(path, review, llm_rerun=from_ocr_cache)
             print(f"\nSummary saved to: {summary_path}")
         summary_text = review.get("answer", "") or review.get("error", "")
-        append_run_log_row(path, start_ts, ocr_time_sec, review.get("processing_time_seconds"), plain, summary_text, _provider_display(review.get("llm_provider", "")))
+        append_run_log_row(path, start_ts, ocr_time_sec, review.get("processing_time_seconds"), plain, summary_text, _provider_display(review.get("llm_provider", "")), log_path=run_log_path)
         return (None, plain, review) if from_ocr_cache else (structured, plain, review)
     if not plain.strip():
-        append_run_log_row(path, start_ts, ocr_time_sec, None, plain, "No text extracted", "")
+        append_run_log_row(path, start_ts, ocr_time_sec, None, plain, "No text extracted", "", log_path=run_log_path)
         return (None, plain, None) if from_ocr_cache else (structured, plain, None)
     if not ask_review:
-        append_run_log_row(path, start_ts, ocr_time_sec, None, plain, "(extraction only, no LLM)", "")
+        append_run_log_row(path, start_ts, ocr_time_sec, None, plain, "(extraction only, no LLM)", "", log_path=run_log_path)
         return (None, plain, None) if from_ocr_cache else (structured, plain, None)
 
 
@@ -894,8 +1394,16 @@ def _extract_pdf_only(
     path: Path,
     use_ocr_fallback: bool = True,
     force_ocr: bool = False,
+    ocr_method: str | None = None,
+    llm: str = "auto",
 ) -> tuple[str, list[dict]]:
-    """Extract text from PDF (no LLM). Returns (plain_text, structured)."""
+    """Extract text from PDF (no LLM review). Returns (plain_text, structured)."""
+    method = (ocr_method or DEFAULT_OCR_METHOD).strip().lower()
+    if method == OCR_METHOD_LLM:
+        plain, structured = pdf_to_text_via_llm_vision(
+            path, llm=llm, ocr_dpi=DEFAULT_OCR_DPI_FORCED if (force_ocr or _is_in_ocr_dir(path)) else DEFAULT_OCR_DPI
+        )
+        return plain, structured
     force = force_ocr or _is_in_ocr_dir(path)
     ocr_dpi = DEFAULT_OCR_DPI_FORCED if force else DEFAULT_OCR_DPI
     structured = pdf_to_structured_text(
@@ -912,11 +1420,32 @@ def _extract_pdf_only_timed(
     path: Path,
     use_ocr_fallback: bool = True,
     force_ocr: bool = False,
+    ocr_method: str | None = None,
+    llm: str = "auto",
 ) -> tuple[str, list[dict], float]:
     """Extract text from PDF with timing. Returns (plain_text, structured, ocr_time_seconds)."""
     t0 = time.perf_counter()
-    plain, structured = _extract_pdf_only(path, use_ocr_fallback=use_ocr_fallback, force_ocr=force_ocr)
+    plain, structured = _extract_pdf_only(
+        path, use_ocr_fallback=use_ocr_fallback, force_ocr=force_ocr, ocr_method=ocr_method, llm=llm
+    )
     return plain, structured, round(time.perf_counter() - t0, 2)
+
+
+def _extract_file_only_timed(
+    path: Path,
+    use_ocr_fallback: bool = True,
+    force_ocr: bool = False,
+    ocr_method: str | None = None,
+    llm: str = "auto",
+) -> tuple[str, list[dict], float]:
+    """Extract text from PDF or Office file with timing. Returns (plain_text, structured, time_seconds)."""
+    if _is_office_file(path):
+        t0 = time.perf_counter()
+        plain, structured = _extract_office_file(path)
+        return plain, structured, round(time.perf_counter() - t0, 2)
+    return _extract_pdf_only_timed(
+        path, use_ocr_fallback=use_ocr_fallback, force_ocr=force_ocr, ocr_method=ocr_method, llm=llm
+    )
 
 
 def run_files(
@@ -929,22 +1458,32 @@ def run_files(
     retry_interval: int = DEFAULT_RETRY_INTERVAL,
     force_ocr: bool = False,
     overlap_extract_llm: bool = True,
+    ocr_method: str | None = None,
 ):
     """
-    Run extract + optional review on one or more PDF files.
+    Run extract + optional review on one or more files (PDF, Word .doc/.docx, Excel .xls/.xlsx).
     file_names: list of paths (relative to base_dir or cwd, or absolute).
     prompt_file: path to prompt text file (relative to script dir or absolute). Uses prompt.txt in script dir if None.
+    The prompt is loaded once and cached; the same prompt is used for all files (reduces repeated I/O and, with Ollama
+    keep_alive, allows server-side prompt cache reuse).
     overlap_extract_llm: when True and processing multiple files, extract next PDF while LLM reviews current.
+    ocr_method: OCR_METHOD_TESSERACT or OCR_METHOD_LLM. If "llm", use LLM vision for extraction (no Tesseract).
     """
-    if ask_review:
+    method = (ocr_method or DEFAULT_OCR_METHOD).strip().lower()
+    if ask_review or method == OCR_METHOD_LLM:
         ok, err = _check_llm_server(llm)
         if not ok:
-            print(f"Error: {err}", file=sys.stderr)
+            print(err)
             sys.exit(1)
 
     base = base_dir or Path(__file__).resolve().parent
     system_prompt = load_prompt_file(prompt_file) if ask_review else None
     use_ocr = HAS_PDF2IMAGE and HAS_OCR
+    run_log_path = make_run_log_path()
+    print(f"Run log for this run: {run_log_path}\n")
+    # When using local/LM Studio with two models, show which is used for OCR vs summary
+    if (method == OCR_METHOD_LLM or ask_review) and _resolve_llm_provider(llm) == "local" and (LLAMA_VISION_MODEL != LLAMA_MODEL):
+        print(f"LM Studio models: OCR (vision) = {LLAMA_VISION_MODEL}, Summary = {LLAMA_MODEL}\n")
     if ask_review and prompt_file:
         print(f"Prompt file: {prompt_file}\n")
     results = []
@@ -978,7 +1517,9 @@ def run_files(
                     if next_extract_future is not None:
                         plain, structured, ocr_time_sec = next_extract_future.result()
                     else:
-                        plain, structured, ocr_time_sec = _extract_pdf_only_timed(path, use_ocr_fallback=use_ocr, force_ocr=force_ocr)
+                        plain, structured, ocr_time_sec = _extract_file_only_timed(
+                            path, use_ocr_fallback=use_ocr, force_ocr=force_ocr, ocr_method=ocr_method, llm=llm
+                        )
                     next_extract_future = None
                     # Kick off extraction for next file while we run LLM (if multiple files, ask_review)
                     if overlap_extract_llm and ask_review and i + 1 < len(file_names):
@@ -987,7 +1528,7 @@ def run_files(
                             next_path = base / next_path
                         if next_path.exists() and not _load_from_ocr_cache(next_path, OCR_OUTPUT_DIR):
                             next_extract_future = ex.submit(
-                                _extract_pdf_only_timed, next_path, use_ocr, force_ocr
+                                _extract_file_only_timed, next_path, use_ocr, force_ocr, ocr_method, llm
                             )
                     if OCR_OUTPUT_DIR:
                         txt_path = save_extracted_text(path, plain, structured=structured if not from_ocr_cache else None)
@@ -996,13 +1537,13 @@ def run_files(
                 n_chars = len(plain)
                 print(f"  Extracted {n_chars} characters")
                 if not plain.strip():
-                    append_run_log_row(path, start_ts, ocr_time_sec, None, plain, "No text extracted", "")
+                    append_run_log_row(path, start_ts, ocr_time_sec, None, plain, "No text extracted", "", log_path=run_log_path)
                     results.append({"file": path.name, "error": "No text extracted", "json": None})
                     continue
                 elif not ask_review:
                     print("  --- Extracted text (first 500 chars) ---")
                     print((plain[:500] + ("..." if n_chars > 500 else "")))
-                    append_run_log_row(path, start_ts, ocr_time_sec, None, plain, "(extraction only, no LLM)", "")
+                    append_run_log_row(path, start_ts, ocr_time_sec, None, plain, "(extraction only, no LLM)", "", log_path=run_log_path)
                     results.append({"file": path.name, "plain_preview": plain[:500], "review": None})
                     continue
                 else:
@@ -1021,17 +1562,23 @@ def run_files(
                             print("  Gemini fallback failed.")
                 if review.get("error"):
                     print("  --- Error ---", review["error"])
-                    append_run_log_row(path, start_ts, ocr_time_sec, review.get("processing_time_seconds"), plain, review.get("error", "Unknown error"), _provider_display(review.get("llm_provider", "")))
+                    append_run_log_row(path, start_ts, ocr_time_sec, review.get("processing_time_seconds"), plain, review.get("error", "Unknown error"), _provider_display(review.get("llm_provider", "")), log_path=run_log_path)
                     results.append({"file": path.name, "error": review["error"], "json": None})
                     continue
                 print("  --- Review (answer) ---")
                 print("  ", review["answer"].replace("\n", "\n  "))
                 print("  --- Review (JSON) ---")
                 print("  ", json.dumps(review["json"], indent=2, ensure_ascii=False).replace("\n", "\n  "))
+                nc = (review.get("json") or {}).get("number_comparison")
+                if nc:
+                    print("  --- Numbers (Tesseract vs LLM) ---")
+                    print(f"    OCR: {len(nc.get('ocr_numbers', []))} amounts | LLM: {len(nc.get('llm_numbers', []))} | Match: {nc.get('match')}")
+                    if nc.get("mismatches"):
+                        print("    Mismatches:", json.dumps(nc["mismatches"], ensure_ascii=False)[:200] + ("..." if len(json.dumps(nc["mismatches"])) > 200 else ""))
                 summary_path = save_run_summary(path, review, llm_rerun=from_ocr_cache)
                 print(f"  Summary saved to: {summary_path}")
                 summary_text = review.get("answer", "") or review.get("error", "")
-                append_run_log_row(path, start_ts, ocr_time_sec, review.get("processing_time_seconds"), plain, summary_text, _provider_display(review.get("llm_provider", "")))
+                append_run_log_row(path, start_ts, ocr_time_sec, review.get("processing_time_seconds"), plain, summary_text, _provider_display(review.get("llm_provider", "")), log_path=run_log_path)
                 results.append({"file": path.name, "answer": review["answer"], "json": review["json"]})
             except Exception as e:
                 print(f"  Skipped: {e}")
@@ -1054,12 +1601,13 @@ if __name__ == "__main__":
 
     def _main() -> None:
         argv = sys.argv[1:]
-        ask_review = "--no-llama" not in argv
+        ask_review = "--no-llama" not in argv and "--ocr-only" not in argv
         prompt_path = None
         llm_provider = "auto"
         retry = DEFAULT_RETRY
         retry_interval = DEFAULT_RETRY_INTERVAL
         force_ocr = False
+        ocr_method = None
         args = []
         i = 0
         while i < len(argv):
@@ -1071,6 +1619,13 @@ if __name__ == "__main__":
                 llm_provider = argv[i].split("=", 1)[1].strip().lower()
                 if llm_provider not in LLM_PROVIDERS:
                     print(f"Unknown --llm= value: {llm_provider}. Use: {', '.join(LLM_PROVIDERS)}")
+                    sys.exit(1)
+                i += 1
+                continue
+            if argv[i].startswith("--ocr="):
+                ocr_method = argv[i].split("=", 1)[1].strip().lower()
+                if ocr_method not in (OCR_METHOD_TESSERACT, OCR_METHOD_LLM):
+                    print(f"Unknown --ocr= value: {ocr_method}. Use: {OCR_METHOD_TESSERACT} or {OCR_METHOD_LLM}")
                     sys.exit(1)
                 i += 1
                 continue
@@ -1086,31 +1641,38 @@ if __name__ == "__main__":
                 force_ocr = True
                 i += 1
                 continue
-            if argv[i] != "--no-llama":
+            if argv[i] not in ("--no-llama", "--ocr-only"):
                 args.append(argv[i])
             i += 1
 
-        ok, err = _check_tesseract_installed()
-        if not ok:
-            print(f"Error: {err}", file=sys.stderr)
+        if not ocr_method:
+            ocr_method = DEFAULT_OCR_METHOD
+        if ocr_method == OCR_METHOD_TESSERACT:
+            ok, err = _check_tesseract_installed()
+            if not ok:
+                print(f"Error: {err}", file=sys.stderr)
+                sys.exit(1)
+        elif not HAS_PDF2IMAGE:
+            print("Error: OCR method is 'llm' but pdf2image is not installed. pip install pdf2image and install poppler.", file=sys.stderr)
             sys.exit(1)
 
         if not args:
-            run_example(ask_review=ask_review, prompt_file=prompt_path, llm=llm_provider, retry=retry, retry_interval=retry_interval, force_ocr=force_ocr)
+            run_example(ask_review=ask_review, prompt_file=prompt_path, llm=llm_provider, retry=retry, retry_interval=retry_interval, force_ocr=force_ocr, ocr_method=ocr_method)
         else:
-            # Expand directories to their PDF files so multiple files are processed
+            # Expand directories to PDF and Office files
             base = Path(__file__).resolve().parent
             expanded = []
             for a in args:
                 p = Path(a) if Path(a).is_absolute() else base / a
                 if p.is_dir():
-                    expanded.extend(sorted(p.glob("*.pdf")))
+                    for ext in ("*.pdf", "*.doc", "*.docx", "*.xls", "*.xlsx"):
+                        expanded.extend(sorted(p.glob(ext)))
                 else:
                     expanded.append(p)
             if expanded:
-                run_files(expanded, ask_review=ask_review, prompt_file=prompt_path, llm=llm_provider, retry=retry, retry_interval=retry_interval, force_ocr=force_ocr)
+                run_files(expanded, ask_review=ask_review, prompt_file=prompt_path, llm=llm_provider, retry=retry, retry_interval=retry_interval, force_ocr=force_ocr, ocr_method=ocr_method)
             else:
-                print("No PDF files found.")
+                print("No supported files (PDF, doc/docx, xls/xlsx) found.")
 
     try:
         _main()

@@ -13,6 +13,7 @@ venv/
 # Generated output
 invoices_summary/
 ocr_output/
+log_files/
 *.xlsx
 backup/
 

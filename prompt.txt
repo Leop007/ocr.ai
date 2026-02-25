@@ -12,6 +12,7 @@ You must reply with a single JSON object (no other text before or after) with ex
 - "has_issues": (boolean) true if you found any problems, false otherwise.
 - "issues": (array of strings) list of each issue found; use [] if none.
 - "flags": (string) exactly one of "green", "orange", "red" - use the word, NOT emoji. "green" if no issues, "orange" if warnings only, "red" if actual problems. Single overall status only.
+- "numbers": (optional array) key amounts from the invoice for comparison with OCR. Each item: {"label": "Total TTC", "value": 820.00}. Include at least: total/amount to pay, subtotal, VAT if present. Use numeric values only. Omit or use [] if unclear.
 
-Example: {"answer": "The invoice appears correct.", "has_issues": false, "issues": [], "flags": "green"}
-Example: {"answer": "Found two issues: ...", "has_issues": true, "issues": ["Missing VAT number", "Total does not match line items"], "flags": "red"}
+Example: {"answer": "The invoice appears correct.", "has_issues": false, "issues": [], "flags": "green", "numbers": [{"label": "Total TTC", "value": 820.00}, {"label": "VAT 20%", "value": 103.33}]}
+Example: {"answer": "Found two issues: ...", "has_issues": true, "issues": ["Missing VAT number", "Total does not match line items"], "flags": "red", "numbers": []}
