@@ -1,6 +1,8 @@
 """
 Extract text from PDF, structure it, and optionally send to llama.cpp for invoice review.
 """
+from __future__ import annotations
+
 import base64
 import io
 import json
@@ -494,8 +496,13 @@ DEFAULT_OCR_CONFIG = _env("OCR_CONFIG", "--psm 6")
 DEFAULT_OCR_LANG = _env("OCR_LANG", "eng")
 OCR_METHOD_TESSERACT = "tesseract"
 OCR_METHOD_LLM = "llm"
+OCR_METHOD_PADDLEOCR = "paddleocr"
 _ocr_method_env = _env("OCR_METHOD", OCR_METHOD_TESSERACT).strip().lower()
-DEFAULT_OCR_METHOD = OCR_METHOD_LLM if _ocr_method_env == "llm" else OCR_METHOD_TESSERACT
+DEFAULT_OCR_METHOD = (
+    OCR_METHOD_LLM if _ocr_method_env == "llm"
+    else OCR_METHOD_PADDLEOCR if _ocr_method_env == OCR_METHOD_PADDLEOCR
+    else OCR_METHOD_TESSERACT
+)
 
 _invoices_ocr_dir = _env("INVOICES_OCR_DIR", "")
 INVOICES_OCR_DIR = None
@@ -1178,11 +1185,21 @@ def _provider_display(provider: str) -> str:
     return {"local": "LLM Studio", "ollama": "Ollama", "gemini": "Gemini"}.get(provider or "", provider or "")
 
 
-def _load_from_ocr_cache(pdf_path: str | Path, ocr_dir: Path | None = None) -> str | None:
+def _load_from_ocr_cache(pdf_path: str | Path, ocr_dir: Path | None = None, ocr_method: str | None = None) -> str | None:
     """Load extracted text from ocr_output if it exists. Returns content or None."""
     if not ocr_dir:
         return None
     ocr_dir = Path(ocr_dir)
+    method = (ocr_method or DEFAULT_OCR_METHOD).strip().lower()
+    if method == OCR_METHOD_PADDLEOCR:
+        try:
+            from paddle_ocr_pipeline import load_paddle_ocr_cache, ocr_result_to_plain_text
+            cached = load_paddle_ocr_cache(pdf_path, ocr_dir)
+            if cached:
+                return ocr_result_to_plain_text(cached)
+        except ImportError:
+            pass
+        return None
     stem = Path(pdf_path).stem
     txt_path = ocr_dir / f"{stem}_extracted.txt"
     if not txt_path.exists():
@@ -1270,6 +1287,8 @@ def extract_and_review_invoice(
         force = force_ocr or _is_in_ocr_dir(pdf_path)
         ocr_dpi = DEFAULT_OCR_DPI_FORCED if force else DEFAULT_OCR_DPI
         plain, structured = pdf_to_text_via_llm_vision(pdf_path, llm=llm, base_url=llama_url, ocr_dpi=ocr_dpi)
+    elif method == OCR_METHOD_PADDLEOCR:
+        plain, structured = _extract_pdf_only(pdf_path, force_ocr=force_ocr, ocr_method=method)
     else:
         force = force_ocr or _is_in_ocr_dir(pdf_path)
         ocr_dpi = DEFAULT_OCR_DPI_FORCED if force else DEFAULT_OCR_DPI
@@ -1281,7 +1300,7 @@ def extract_and_review_invoice(
             force_ocr=force,
         )
         plain = structured_to_plain_text(structured)
-    if OCR_OUTPUT_DIR:
+    if OCR_OUTPUT_DIR and method != OCR_METHOD_PADDLEOCR:
         save_extracted_text(pdf_path, plain, structured=structured)
     if not plain.strip():
         return plain, {"answer": "No text could be extracted from the PDF.", "json": {"answer": "No text.", "has_issues": None, "issues": []}, "llm_provider": "", "llm_model": "", "processing_time_seconds": None}
@@ -1313,7 +1332,7 @@ def run_example(pdf_path: str | Path | None = None, ask_review: bool = True, pro
     run_log_path = make_run_log_path()
     print(f"Run log: {run_log_path}\n")
 
-    plain = _load_from_ocr_cache(path, OCR_OUTPUT_DIR)
+    plain = _load_from_ocr_cache(path, OCR_OUTPUT_DIR, ocr_method=method)
     from_ocr_cache = plain is not None
     structured = None
     ocr_time_sec: float | None = 0.0 if from_ocr_cache else None
@@ -1325,6 +1344,9 @@ def run_example(pdf_path: str | Path | None = None, ask_review: bool = True, pro
             plain, structured = pdf_to_text_via_llm_vision(
                 path, llm=llm, ocr_dpi=DEFAULT_OCR_DPI_FORCED if (force_ocr or _is_in_ocr_dir(path)) else DEFAULT_OCR_DPI
             )
+            print(f"Pages: {len(structured)}\n")
+        elif method == OCR_METHOD_PADDLEOCR:
+            plain, structured = _extract_pdf_only(path, force_ocr=force_ocr, ocr_method=method)
             print(f"Pages: {len(structured)}\n")
         else:
             force = force_ocr or _is_in_ocr_dir(path)
@@ -1338,9 +1360,11 @@ def run_example(pdf_path: str | Path | None = None, ask_review: bool = True, pro
             )
             print(f"Pages: {len(structured)}\n")
             plain = structured_to_plain_text(structured)
-        if OCR_OUTPUT_DIR:
+        if OCR_OUTPUT_DIR and method != OCR_METHOD_PADDLEOCR:
             save_extracted_text(path, plain, structured=structured)
             print(f"Extracted text saved to {OCR_OUTPUT_DIR}/\n")
+        elif method == OCR_METHOD_PADDLEOCR and OCR_OUTPUT_DIR:
+            print(f"Extracted JSON saved to {OCR_OUTPUT_DIR}/paddleocr/\n")
         ocr_time_sec = round(time.perf_counter() - t_ocr, 2)
     print("--- Extracted text (first 1500 chars) ---\n")
     print(plain[:1500] + ("..." if len(plain) > 1500 else ""))
@@ -1404,6 +1428,24 @@ def _extract_pdf_only(
             path, llm=llm, ocr_dpi=DEFAULT_OCR_DPI_FORCED if (force_ocr or _is_in_ocr_dir(path)) else DEFAULT_OCR_DPI
         )
         return plain, structured
+    if method == OCR_METHOD_PADDLEOCR:
+        try:
+            from paddle_ocr_pipeline import (
+                ocr_result_to_plain_text,
+                process_pdf,
+                save_paddle_ocr_cache,
+            )
+            result = process_pdf(path, force_ocr=force_ocr or _is_in_ocr_dir(path))
+            if result.get("error"):
+                raise RuntimeError(result["error"])
+            plain = ocr_result_to_plain_text(result)
+            if OCR_OUTPUT_DIR:
+                save_paddle_ocr_cache(result, path, OCR_OUTPUT_DIR)
+            structured = [{"page": p.get("page", i + 1), "text": p.get("plain_text", ""), "source": p.get("source", "ocr")}
+                         for i, p in enumerate(result.get("pages", []))]
+            return plain, structured
+        except ImportError:
+            return "", []
     force = force_ocr or _is_in_ocr_dir(path)
     ocr_dpi = DEFAULT_OCR_DPI_FORCED if force else DEFAULT_OCR_DPI
     structured = pdf_to_structured_text(
@@ -1504,7 +1546,7 @@ def run_files(
                 continue
             try:
                 # Check for cached ocr_output first
-                plain = _load_from_ocr_cache(path, OCR_OUTPUT_DIR)
+                plain = _load_from_ocr_cache(path, OCR_OUTPUT_DIR, ocr_method=ocr_method)
                 from_ocr_cache = plain is not None
                 ocr_time_sec: float | None = 0.0 if from_ocr_cache else None
                 if from_ocr_cache:
@@ -1526,11 +1568,11 @@ def run_files(
                         next_path = Path(file_names[i + 1])
                         if not next_path.is_absolute():
                             next_path = base / next_path
-                        if next_path.exists() and not _load_from_ocr_cache(next_path, OCR_OUTPUT_DIR):
+                        if next_path.exists() and not _load_from_ocr_cache(next_path, OCR_OUTPUT_DIR, ocr_method=ocr_method):
                             next_extract_future = ex.submit(
                                 _extract_file_only_timed, next_path, use_ocr, force_ocr, ocr_method, llm
                             )
-                    if OCR_OUTPUT_DIR:
+                    if OCR_OUTPUT_DIR and method != OCR_METHOD_PADDLEOCR:
                         txt_path = save_extracted_text(path, plain, structured=structured if not from_ocr_cache else None)
                         if txt_path:
                             print(f"  Extracted text saved to {txt_path}")
@@ -1624,8 +1666,8 @@ if __name__ == "__main__":
                 continue
             if argv[i].startswith("--ocr="):
                 ocr_method = argv[i].split("=", 1)[1].strip().lower()
-                if ocr_method not in (OCR_METHOD_TESSERACT, OCR_METHOD_LLM):
-                    print(f"Unknown --ocr= value: {ocr_method}. Use: {OCR_METHOD_TESSERACT} or {OCR_METHOD_LLM}")
+                if ocr_method not in (OCR_METHOD_TESSERACT, OCR_METHOD_LLM, OCR_METHOD_PADDLEOCR):
+                    print(f"Unknown --ocr= value: {ocr_method}. Use: {OCR_METHOD_TESSERACT}, {OCR_METHOD_LLM}, or {OCR_METHOD_PADDLEOCR}")
                     sys.exit(1)
                 i += 1
                 continue
@@ -1652,6 +1694,16 @@ if __name__ == "__main__":
             if not ok:
                 print(f"Error: {err}", file=sys.stderr)
                 sys.exit(1)
+        elif ocr_method == OCR_METHOD_PADDLEOCR:
+            try:
+                from paddle_ocr_pipeline import _check_dependencies
+                ok, err = _check_dependencies()
+                if not ok:
+                    print(f"Error: {err}", file=sys.stderr)
+                    sys.exit(1)
+            except ImportError:
+                print("Error: paddle_ocr_pipeline not found. pip install paddleocr paddlepaddle pdfplumber opencv-python", file=sys.stderr)
+                sys.exit(1)
         elif not HAS_PDF2IMAGE:
             print("Error: OCR method is 'llm' but pdf2image is not installed. pip install pdf2image and install poppler.", file=sys.stderr)
             sys.exit(1)
@@ -1659,14 +1711,23 @@ if __name__ == "__main__":
         if not args:
             run_example(ask_review=ask_review, prompt_file=prompt_path, llm=llm_provider, retry=retry, retry_interval=retry_interval, force_ocr=force_ocr, ocr_method=ocr_method)
         else:
-            # Expand directories to PDF and Office files
+            # Expand directories and glob patterns to PDF and Office files
             base = Path(__file__).resolve().parent
+            supported_ext = {".pdf", ".doc", ".docx", ".xls", ".xlsx"}
             expanded = []
             for a in args:
                 p = Path(a) if Path(a).is_absolute() else base / a
                 if p.is_dir():
                     for ext in ("*.pdf", "*.doc", "*.docx", "*.xls", "*.xlsx"):
                         expanded.extend(sorted(p.glob(ext)))
+                elif "*" in str(a) or "?" in str(a):
+                    parent = p.parent
+                    pattern = p.name
+                    if parent.exists() or (base / parent).exists():
+                        search_dir = parent if parent.is_absolute() else base / parent
+                        for f in sorted(search_dir.glob(pattern)):
+                            if f.is_file() and f.suffix.lower() in supported_ext:
+                                expanded.append(f)
                 else:
                     expanded.append(p)
             if expanded:
