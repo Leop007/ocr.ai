@@ -1,0 +1,13 @@
+# PaddleOCR pipeline (--ocr=paddleocr): layout, tables, critical-field verification
+# Requires Python 3.8–3.12. Not compatible with Python 3.13+ (paddlepaddle has no wheel).
+#
+# Optional: PADDLE_STAGED_OCR=1 for 3-stage (A=200 DPI fast, B=300 table crop, C=400 critical verify).
+# PADDLE_DUAL_OCR=1 merge region+fullpage. PADDLE_USE_TABLE_RECOGNITION=1 table. PADDLE_FAST_OCR=0 server models.
+-r requirements.txt
+
+paddleocr>=2.6.0.3
+paddlepaddle
+paddlex[ocr]  # Required for PPStructureV3; base paddleocr lacks OCR pipeline deps
+pdfplumber
+opencv-python
+numpy

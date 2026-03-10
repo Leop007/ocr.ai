@@ -13,12 +13,16 @@ Usage:
   python compare_ocr_run_log.py file1.xlsx file2.xlsx
   python compare_ocr_run_log.py log_files/run1.xlsx log_files/run2.xlsx --output comparison.xlsx
   python compare_ocr_run_log.py --no-gemini   # skip LLM column
+  python compare_ocr_run_log.py --delay 2     # seconds between Gemini API calls (helps avoid 429 rate limits)
 
 Exactly 2 run log files must be passed. Default output: log_files/ocr_comparison_YYYY-MM-DD_HHMMSS.xlsx
+
+Environment (for Gemini retries): GEMINI_RETRIES (default 5), GEMINI_RETRY_BASE_SEC (default 5, backoff 5s/10s/20s/40s...).
 """
 import difflib
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -121,9 +125,24 @@ def _gemini_metadata_consistent(summary1: str, summary2: str) -> tuple[str, str]
         "contents": [{"parts": [{"text": user_content}]}],
         "generationConfig": {"maxOutputTokens": 512, "temperature": 0.1},
     }
+    max_retries = max(1, int(os.environ.get("GEMINI_RETRIES", "5") or "5"))
+    base_delay = max(1, float(os.environ.get("GEMINI_RETRY_BASE_SEC", "5") or "5"))
     try:
-        r = requests.post(url, json=payload, headers=headers, timeout=60)
-        r.raise_for_status()
+        for attempt in range(max_retries):
+            try:
+                r = requests.post(url, json=payload, headers=headers, timeout=60)
+                if r.status_code in (503, 502, 429) and attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    time.sleep(delay)
+                    continue
+                r.raise_for_status()
+                break
+            except requests.exceptions.RequestException:
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    time.sleep(delay)
+                    continue
+                raise
         data = r.json()
         parts = (data.get("candidates", [{}])[0].get("content", {}).get("parts", []))
         text = (parts[0].get("text", "") if parts else "").strip()
@@ -184,10 +203,14 @@ def main() -> None:
     script_dir = Path(__file__).resolve().parent
     argv = sys.argv[1:]
 
-    # Parse --input / --output / --no-gemini
+    # Parse --input / --output / --no-gemini / --delay / --help
+    if "--help" in argv or "-h" in argv:
+        print(__doc__)
+        sys.exit(0)
     input_paths: list[Path] = []
     output_path: Path | None = None
     use_gemini = True
+    delay_between_docs = 0.0
     i = 0
     while i < len(argv):
         if argv[i] == "--input" and i + 1 < len(argv):
@@ -201,6 +224,13 @@ def main() -> None:
         if argv[i] == "--no-gemini":
             use_gemini = False
             i += 1
+            continue
+        if argv[i] == "--delay" and i + 1 < len(argv):
+            try:
+                delay_between_docs = max(0.0, float(argv[i + 1]))
+            except ValueError:
+                pass
+            i += 2
             continue
         if not argv[i].startswith("-"):
             input_paths.append(Path(argv[i]))
@@ -337,6 +367,8 @@ def main() -> None:
 
         if use_gemini:
             if summary1 and summary2:
+                if delay_between_docs > 0 and r > 2:
+                    time.sleep(delay_between_docs)
                 meta, summary_inconsistent = _gemini_metadata_consistent(summary1, summary2)
             else:
                 meta, summary_inconsistent = "N/A (only in one run)", ""

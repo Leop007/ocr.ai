@@ -8,7 +8,33 @@ Extract text from PDF invoices and optionally send it to a llama.cpp server for 
 pip install -r requirements.txt
 ```
 
-For scanned PDFs you also need **poppler** (e.g. `sudo apt install poppler-utils` on Ubuntu).
+**System dependencies:**
+- **poppler** – for scanned PDFs (e.g. `brew install poppler` on macOS, `apt install poppler-utils` on Ubuntu)
+- **Tesseract** – for OCR (e.g. `brew install tesseract tesseract-lang` on macOS)
+
+**PaddleOCR pipeline** (when using `--ocr=paddleocr`):
+- Requires **Python 3.8–3.12** (paddlepaddle has no wheel for 3.13+)
+- Install: `pip install -r requirements-paddleocr.txt`
+
+### Dependencies for future installations
+
+| Package | Purpose |
+|---------|---------|
+| PyPDF2 | PDF text extraction |
+| pillow | Image handling |
+| pytesseract | Tesseract OCR wrapper |
+| requests | HTTP (Gemini API, local LLM) |
+| python-dotenv | .env config loading |
+| pdf2image | PDF→image for OCR |
+| poppler | Required by pdf2image |
+| openpyxl | Excel run logs |
+| python-docx | Word extraction |
+| xlrd | Legacy Excel (.xls) |
+| paddleocr | PP-Structure layout + OCR |
+| paddlepaddle | PaddleOCR backend |
+| pdfplumber | Digital PDF text/layout |
+| opencv-python | Image preprocessing |
+| numpy | Arrays (OpenCV, Paddle) |
 
 ## Usage
 
@@ -36,7 +62,7 @@ Paths are relative to the `ocr` directory (or use absolute paths). Each file is 
 | `--ocr-only` | OCR only: extract text with Tesseract (and digital extraction); no LLM review. Same as `--no-llama`. |
 | `--no-llama` | Same as `--ocr-only`: extraction only, no LLM. |
 | `--force-ocr` | Always use OCR on every page (for scanned PDFs). Uses 300 DPI. |
-| `--ocr=<method>` | Extraction method: `tesseract` (default) or `llm`. If `llm`, PDF pages are sent to a vision LLM instead of Tesseract (no Tesseract required). |
+| `--ocr=<method>` | Extraction method: `tesseract` (default), `llm`, or `paddleocr`. `paddleocr` uses PaddleOCR PP-Structure + Tesseract critical-field verification; outputs JSON to `ocr_output/paddleocr/`. |
 | `--llm=<provider>` | When using LLM: `auto` (default), `local` (llama.cpp / LM Studio), `ollama` (Ollama), or `gemini` (Google AI). |
 | `--retry=<n>` | Number of retries on timeout/server error/empty response (default: 2). |
 | `--retry_interval=<n>` | Seconds to wait between retries (default: 2). |
@@ -67,6 +93,14 @@ python main.py --retry=4 --retry_interval=5 invoice.pdf
 
 # Use a custom prompt file
 python main.py --prompt my_prompt.txt invoice.pdf
+
+# PaddleOCR + Tesseract pipeline (per invoice processing spec; outputs JSON)
+python main.py --ocr=paddleocr invoice.pdf
+python main.py --ocr=paddleocr --ocr-only invoice.pdf   # extraction only, no LLM review
+
+# Standalone PaddleOCR script (no main.py integration)
+python run_paddle_ocr.py invoice.pdf
+python run_paddle_ocr.py --force-ocr invoice.pdf
 ```
 
 ### Local vs remote LLM

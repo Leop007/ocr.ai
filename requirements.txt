@@ -7,3 +7,6 @@ pdf2image
 openpyxl>=3.1
 python-docx
 xlrd
+
+# Optional: PaddleOCR pipeline (--ocr=paddleocr). Requires Python 3.8–3.12 (paddlepaddle has no wheel for 3.13+).
+# pip install -r requirements-paddleocr.txt
