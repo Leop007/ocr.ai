@@ -32,6 +32,13 @@ try:
     HAS_OCR = True
 except ImportError:
     HAS_OCR = False
+
+# Optional: image preprocessing (pip install pillow)
+try:
+    from PIL import Image, ImageFilter, ImageOps  # type: ignore
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
 try:
     from docx import Document as DocxDocument
     HAS_DOCX = True
@@ -124,6 +131,243 @@ def extract_text_via_ocr(image, config: str | None = None, lang: str | None = No
         return ""
 
 
+# ---------------------------
+# OCR improvements (generic)
+# ---------------------------
+
+# money with comma OR dot decimals
+_MONEY_RE = re.compile(r"\b\d{1,3}(?:[ .]\d{3})*(?:,\d{2}|\.\d{2})\b")
+_EUR_RE = re.compile(r"€|EUR\b", re.I)
+
+
+def preprocess_for_ocr(img):
+    """
+    Lightweight preprocessing for invoices/tables:
+    - grayscale
+    - autocontrast
+    - slight sharpen
+    - binarize (threshold)
+    No-op if Pillow is not installed.
+    """
+    if not HAS_PIL or img is None:
+        return img
+    try:
+        g = img.convert("L")
+        g = ImageOps.autocontrast(g)
+        g = g.filter(ImageFilter.UnsharpMask(radius=1, percent=150, threshold=3))
+
+        # single threshold; generic and fast
+        thr = _env_int("OCR_THRESHOLD", 170)
+        bw = g.point(lambda p: 255 if p > thr else 0)
+        return bw
+    except Exception:
+        return img
+
+
+def score_invoice_text(t: str) -> int:
+    """Heuristic score: prefer OCR results that contain amounts and invoice keywords."""
+    if not t:
+        return 0
+    s = 0
+    s += 3 * len(_MONEY_RE.findall(t))
+    s += 5 * len(_EUR_RE.findall(t))
+
+    low = t.lower()
+
+    # General doc markers that often exist even on pages without totals
+    for kw, w in [
+        ("facture", 8),
+        ("invoice", 8),
+        ("bon de commande", 8),
+        ("commande", 6),
+        ("concerne", 4),
+        ("libellé", 4),
+        ("libelle", 4),
+        ("montant", 4),
+        ("tva", 6),
+        ("vat", 6),
+        ("total", 6),
+        ("sous-total", 4),
+        ("subtotal", 4),
+        ("htva", 6),
+        ("ttc", 6),
+    ]:
+        if kw in low:
+            s += w
+
+    # Stronger phrases
+    for kw, w in [
+        ("total à payer", 18),
+        ("total a payer", 18),
+        ("total tva", 12),
+        ("montant total", 10),
+    ]:
+        if kw in low:
+            s += w
+
+    return s
+
+
+def extract_text_via_ocr_best(image, config: str | None = None, lang: str | None = None) -> str:
+    """
+    Run OCR in 2 passes and keep the best result:
+    - original image
+    - preprocessed image (contrast + binarize)
+
+    Selection rules (IMPORTANT to avoid "empty pages"):
+      1) Never pick empty over non-empty
+      2) Higher heuristic score wins
+      3) If tie, longer text wins
+    """
+    t1 = extract_text_via_ocr(image, config=config, lang=lang)
+    img2 = preprocess_for_ocr(image)
+    t2 = extract_text_via_ocr(img2, config=config, lang=lang)
+
+    s1 = score_invoice_text(t1)
+    s2 = score_invoice_text(t2)
+
+    # Never pick empty over non-empty
+    if (t1 or "").strip() and not (t2 or "").strip():
+        return t1
+    if (t2 or "").strip() and not (t1 or "").strip():
+        return t2
+
+    # Prefer higher score; if tie, prefer longer text
+    if s2 > s1:
+        return t2
+    if s1 > s2:
+        return t1
+
+    return t2 if len(t2) > len(t1) else t1
+
+
+# ---------------------------
+# Word-level OCR for amounts
+# ---------------------------
+
+# strict-ish token for amount like "3,04" or "19.00" or "1 234,56"
+_AMOUNT_TOKEN_RE = re.compile(r"^\d{1,3}(?:[ .]\d{3})*(?:,\d{2}|\.\d{2})$")
+
+_TOTAL_HINTS = {
+    "total", "tva", "vat", "sous-total", "subtotal", "payer", "à", "a",
+    "montant", "htva", "ttc", "due", "balance"
+}
+
+
+def _safe_int(x, default=-1) -> int:
+    try:
+        # tesseract conf is often string like "87" or "-1"
+        return int(float(x))
+    except Exception:
+        return default
+
+
+def extract_amount_candidates_from_image(img, lang: str, base_cfg: str) -> list[dict]:
+    """
+    Generic: use word-level OCR with coordinates to find monetary amounts and their line context.
+    Returns list of dicts: {"amount":"3,04", "line":"Total TVA 16% 3,04", "conf":87, "score":42}
+    """
+    if not HAS_OCR:
+        return []
+
+    # Scale-up helps tiny fonts; generic, no template assumptions
+    if HAS_PIL and img is not None:
+        try:
+            img = img.resize((img.size[0] * 2, img.size[1] * 2), Image.Resampling.LANCZOS)
+        except Exception:
+            pass
+
+    # Mild preprocessing for the numeric extraction pass as well
+    img = preprocess_for_ocr(img)
+
+    # For data extraction, psm 3 is usually a good generic default.
+    cfg = (base_cfg or "").strip()
+    if "--psm" not in cfg:
+        cfg = (cfg + " --psm 3").strip()
+
+    try:
+        from pytesseract import Output  # type: ignore
+    except Exception:
+        return []
+
+    try:
+        data = pytesseract.image_to_data(img, lang=lang, config=cfg, output_type=Output.DICT)
+    except Exception:
+        return []
+
+    texts = data.get("text", [])
+    if not texts:
+        return []
+
+    # Group by (block, par, line)
+    lines: dict[tuple[int, int, int], list[tuple[int, str, int]]] = {}
+    n = len(texts)
+    for i in range(n):
+        txt = (texts[i] or "").strip()
+        if not txt:
+            continue
+        conf = _safe_int(data.get("conf", ["-1"])[i], default=-1)
+        key = (
+            int(data.get("block_num", [0])[i]),
+            int(data.get("par_num", [0])[i]),
+            int(data.get("line_num", [0])[i]),
+        )
+        lines.setdefault(key, []).append((i, txt, conf))
+
+    candidates: list[dict] = []
+
+    for _key, items in lines.items():
+        items.sort(key=lambda x: x[0])
+        words = [w for _, w, _ in items]
+        line_text = " ".join(words)
+
+        # keyword hints on that line
+        low_words = {w.lower().strip(":|") for w in words}
+        has_total_hint = bool(low_words & _TOTAL_HINTS)
+
+        for _i, w, conf in items:
+            token = w.strip()
+            token = token.replace("€", "").replace("EUR", "").replace("eur", "").strip()
+            token = re.sub(r"[^0-9,.\s]", "", token).strip()
+
+            if not _AMOUNT_TOKEN_RE.match(token):
+                continue
+
+            score = 0
+            score += 15 if has_total_hint else 0
+            score += max(0, conf) // 10
+            if "€" in w or "eur" in line_text.lower():
+                score += 5
+
+            candidates.append({
+                "amount": token,
+                "line": line_text,
+                "conf": conf,
+                "score": score,
+            })
+
+    # Sort best first; dedupe by (amount, line)
+    seen = set()
+    out: list[dict] = []
+    for c in sorted(candidates, key=lambda d: d["score"], reverse=True):
+        k = (c["amount"], c["line"])
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(c)
+
+    return out
+
+
+def append_amount_candidates_section(base_text: str, candidates: list[dict], limit: int = 30) -> str:
+    if not candidates:
+        return base_text
+    lines = []
+    for c in candidates[:limit]:
+        lines.append(f"- {c['amount']} | conf={c.get('conf', -1)} | {c.get('line', '')}")
+    return (base_text + "\n\n--- AMOUNT_CANDIDATES (word-level OCR) ---\n" + "\n".join(lines)).strip()
+
+
 def pdf_to_structured_text(
     pdf_path: str | Path,
     use_ocr_fallback: bool = True,
@@ -180,8 +424,21 @@ def pdf_to_structured_text(
     # Run OCR on needed pages (parallel if multiple)
     if not ocr_jobs:
         return [{"page": p, "text": t, "source": s} for p, t, s in sorted(prelim, key=lambda x: x[0])]
+    enable_amount_candidates = _env_bool("ENABLE_AMOUNT_CANDIDATES", True)
+    amount_candidates_max = _env_int("AMOUNT_CANDIDATES_MAX", 30)
+
     def _run_ocr(img, cfg, lang):
-        return extract_text_via_ocr(img, config=cfg, lang=lang)
+        # Multi-pass best OCR for base text
+        t = extract_text_via_ocr_best(img, config=cfg, lang=lang)
+        t = normalize_text(t)
+
+        # Word-level amount candidates (template-agnostic)
+        if enable_amount_candidates:
+            cands = extract_amount_candidates_from_image(img, lang=lang, base_cfg=cfg)
+            if cands:
+                t = append_amount_candidates_section(t, cands, limit=amount_candidates_max)
+
+        return t
 
     if len(ocr_jobs) == 1 or (ocr_workers or 1) <= 1:
         result = [(p, normalize_text(_run_ocr(img, tesseract_config, tesseract_lang)), "ocr") for p, img, _ in ocr_jobs]

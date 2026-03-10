@@ -1,5 +1,6 @@
 # Local config (keep .env.example)
 .env
+run_all+csv.sh
 
 # Python
 __pycache__/
@@ -26,4 +27,7 @@ Thumbs.db
 # Optional: uncomment to avoid committing PDFs
 invoices/
 invoices_summary/
+BATCH_CSVs/
+BATCH_LOG/
+Archive/
 *.pdf
